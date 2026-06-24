@@ -135,7 +135,12 @@ func (s *Server) Shutdown() error {
 // Addr returns the server's listening address (useful in tests when
 // binding to port 0). Empty if the server has never been started.
 func (s *Server) Addr() string {
-	if s == nil || s.httpServer == nil {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.httpServer == nil {
 		return ""
 	}
 	return s.httpServer.Addr
@@ -144,7 +149,12 @@ func (s *Server) Addr() string {
 // ListenerAddr returns the host:port after a successful listen (useful
 // when binding to port 0 so the caller can discover the actual port).
 func (s *Server) ListenerAddr() string {
-	if s == nil || s.httpServer == nil {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.httpServer == nil {
 		return ""
 	}
 	if ln, ok := s.listener.Load().(net.Listener); ok && ln != nil {
