@@ -214,7 +214,10 @@ func CreateRequest(original *parser.SIPMsg, method parser.RequestMethod) *parser
 		return nil
 	}
 
-	clone := original.Clone()
+	clone, err := original.Clone()
+	if err != nil {
+		return nil
+	}
 	// Reset Max-Forwards to a fresh value when changing destination.
 	if !clone.DecrementMaxForwards() {
 		// If missing, add a default Max-Forwards header.

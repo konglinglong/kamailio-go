@@ -70,6 +70,7 @@ type Action struct {
 	IfFalse   []*Action
 	RouteName string
 	Expr      *Expr
+	Switch    *SwitchStmt // switch statement data (when Type == ActSwitch)
 }
 
 // Script is the parsed, executable program.
@@ -154,9 +155,23 @@ func tokenize(text string) ([]tok, error) {
 		case c == '$':
 			start := i
 			i++
+			parenDepth := 0
 			for i < n {
 				cc := text[i]
-				if isPVChar(cc) {
+				if cc == '(' {
+					parenDepth++
+					i++
+					continue
+				}
+				if cc == ')' {
+					if parenDepth > 0 {
+						parenDepth--
+						i++
+						continue
+					}
+					break // unmatched ')' — end of PV token
+				}
+				if unicode.IsLetter(rune(cc)) || unicode.IsDigit(rune(cc)) || cc == '_' {
 					i++
 					continue
 				}
@@ -193,7 +208,7 @@ func tokenize(text string) ([]tok, error) {
 
 func isSymChar(c byte) bool {
 	switch c {
-	case '{', '}', '(', ')', ';', ',', '=', '!', '<', '>', '[', ']':
+	case '{', '}', '(', ')', ';', ',', '=', '!', '<', '>', '[', ']', ':':
 		return true
 	}
 	return false
@@ -350,6 +365,14 @@ func (p *parserState) parseAction() (*Action, error) {
 	switch t.text {
 	case "if":
 		return p.parseIf()
+	case "switch":
+		return p.parseSwitch()
+	case "break":
+		p.advance()
+		if _, err := p.maybeSemicolon(); err != nil {
+			return nil, err
+		}
+		return &Action{Type: ActBreak}, nil
 	case "forward":
 		return p.parseForward()
 	case "sl_send_reply":
@@ -557,6 +580,145 @@ func (p *parserState) parseIf() (*Action, error) {
 		act.IfFalse = falseBlock
 	}
 	return act, nil
+}
+
+// parseSwitch handles `switch (expr) { case ...: ... default: ... }`.
+func (p *parserState) parseSwitch() (*Action, error) {
+	p.advance() // consume "switch"
+	if _, err := p.expect(tokSymbol, "("); err != nil {
+		return nil, err
+	}
+	expr, err := p.parseSwitchExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tokSymbol, ")"); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tokSymbol, "{"); err != nil {
+		return nil, err
+	}
+
+	sw := &SwitchStmt{Expr: expr}
+
+	for {
+		t := p.cur()
+		if t.kind == tokSymbol && t.text == "}" {
+			p.advance()
+			break
+		}
+		if t.kind == tokEOF {
+			return nil, fmt.Errorf("line %d: unexpected end of script in switch", t.line)
+		}
+		if t.kind != tokIdent {
+			return nil, fmt.Errorf("line %d: expected 'case' or 'default' in switch, got %q", t.line, t.text)
+		}
+
+		switch strings.ToLower(t.text) {
+		case "case":
+			p.advance() // consume "case"
+			values := []string{}
+			for {
+				valTok := p.cur()
+				var val string
+				switch valTok.kind {
+				case tokString, tokNumber, tokIdent:
+					val = valTok.text
+				default:
+					return nil, fmt.Errorf("line %d: expected case value, got %q", valTok.line, valTok.text)
+				}
+				p.advance()
+				values = append(values, val)
+
+				if _, err := p.expect(tokSymbol, ":"); err != nil {
+					return nil, err
+				}
+
+				// Check for fall-through label: consecutive `case`
+				// labels without actions share the same block.
+				next := p.cur()
+				if next.kind == tokIdent && strings.ToLower(next.text) == "case" {
+					p.advance() // consume "case"
+					continue
+				}
+				break
+			}
+
+			actions, err := p.parseCaseActions()
+			if err != nil {
+				return nil, err
+			}
+			sw.Cases = append(sw.Cases, &SwitchCase{Values: values, Actions: actions})
+
+		case "default":
+			p.advance() // consume "default"
+			if _, err := p.expect(tokSymbol, ":"); err != nil {
+				return nil, err
+			}
+			actions, err := p.parseCaseActions()
+			if err != nil {
+				return nil, err
+			}
+			sw.Cases = append(sw.Cases, &SwitchCase{IsDefault: true, Actions: actions})
+
+		default:
+			return nil, fmt.Errorf("line %d: expected 'case' or 'default' in switch, got %q", t.line, t.text)
+		}
+	}
+
+	return &Action{Type: ActSwitch, Switch: sw}, nil
+}
+
+// parseCaseActions reads actions inside a case body until the next
+// `case`, `default`, or closing `}`.
+func (p *parserState) parseCaseActions() ([]*Action, error) {
+	var actions []*Action
+	for {
+		t := p.cur()
+		if t.kind == tokEOF {
+			return nil, fmt.Errorf("line %d: unexpected end of script in case body", t.line)
+		}
+		if t.kind == tokSymbol && t.text == "}" {
+			return actions, nil
+		}
+		if t.kind == tokIdent && (strings.ToLower(t.text) == "case" || strings.ToLower(t.text) == "default") {
+			return actions, nil
+		}
+		a, err := p.parseAction()
+		if err != nil {
+			return nil, err
+		}
+		if a != nil {
+			actions = append(actions, a)
+		}
+	}
+}
+
+// parseSwitchExpr parses the value expression inside `switch (...)`.
+// It accepts pseudo-variables ($rU, $rm, ...), the "method" and "uri"
+// keywords, and $var(name) references.
+func (p *parserState) parseSwitchExpr() (*Expr, error) {
+	t := p.cur()
+	if t.kind != tokIdent {
+		return nil, fmt.Errorf("line %d: expected expression in switch, got %q", t.line, t.text)
+	}
+
+	lhs := strings.ToLower(t.text)
+	switch lhs {
+	case "method", "uri":
+		p.advance()
+		return &Expr{LeftStr: lhs}, nil
+	default:
+		if pv := ParsePV(t.text); pv != PVNone {
+			p.advance()
+			return &Expr{LeftPV: pv}, nil
+		}
+		if strings.HasPrefix(lhs, "$var(") && strings.HasSuffix(lhs, ")") {
+			p.advance()
+			return &Expr{LeftStr: t.text}, nil
+		}
+		return nil, fmt.Errorf("line %d: unexpected expression token %q in switch", t.line, t.text)
+	}
 }
 
 // parseExpr parses one boolean expression.

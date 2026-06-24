@@ -425,6 +425,13 @@ func DoAction(ctx *RunActCtx, a *Action, msg *parser.SIPMsg, execCtx *ExecContex
 		}
 		return 1
 
+	// --- Switch/case ---
+	case ActSwitch:
+		if a.Switch != nil {
+			return EvalSwitch(ctx, a.Switch, msg, execCtx)
+		}
+		return 1
+
 	default:
 		log.Warn(fmt.Sprintf("do_action: unknown action type %d", a.Type))
 		return 1
