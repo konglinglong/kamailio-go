@@ -112,7 +112,7 @@ func TestParseHeaders(t *testing.T) {
 	// Skip first line
 	_, remaining, _ := ParseFirstLine(testInvite)
 
-	headers, bodyOffset, err := ParseHeaders(remaining)
+	headers, bodyOffset, err := ParseHeaders(remaining, 0)
 	if err != nil {
 		t.Fatalf("parse headers error: %v", err)
 	}

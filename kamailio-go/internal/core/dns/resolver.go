@@ -205,17 +205,75 @@ func (r *Resolver) Resolve(domain string, proto Proto, port uint16) ([]*Addr, er
 	return addrs, err
 }
 
-// resolveNAPTR performs NAPTR lookup
+// resolveNAPTR performs a real NAPTR lookup via the process-wide
+// NAPTRProvider (default: system DNS query). It filters the returned
+// records to those advertising the requested transport protocol and
+// follows the RFC 3263 procedure:
+//
+//  1. If NAPTR records exist and at least one has the "S" flag, the
+//     records are sorted by Order then Preference, and the replacement
+//     domain is used as the SRV query target for matching protocols.
+//  2. If no NAPTR records exist or none match the protocol, the caller
+//     falls back to SRV resolution.
+//
+// Returns ErrNoNAPTR when no usable records are found.
 func (r *Resolver) resolveNAPTR(domain string, proto Proto) ([]*Addr, error) {
-	_ = context.Background() // For future NAPTR implementation
+	prov := DefaultNAPTRProvider()
+	if prov == nil {
+		return nil, ErrNoNAPTR
+	}
 
-	// Look up NAPTR records
-	// Note: Go's net.Resolver doesn't support NAPTR directly
-	// We'll use a simplified approach here
-	// In production, you'd use a DNS library like miekg/dns
+	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	defer cancel()
 
-	// For now, return nil to fall back to SRV
-	return nil, ErrNoNAPTR
+	records, err := prov.LookupNAPTR(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter records matching the requested protocol and having the
+	// "S" flag (terminal, pointing to an SRV record).
+	var matching []NAPTRRecord
+	for _, rec := range records {
+		if !strings.Contains(strings.ToUpper(rec.Flags), "S") {
+			continue
+		}
+		recProto, ok := naptrProtoFromService(rec.Service)
+		if !ok {
+			continue
+		}
+		if recProto == proto {
+			matching = append(matching, rec)
+		}
+	}
+	if len(matching) == 0 {
+		return nil, ErrNoNAPTR
+	}
+
+	// Sort by Order then Preference.
+	sort.SliceStable(matching, func(i, j int) bool {
+		if matching[i].Order != matching[j].Order {
+			return matching[i].Order < matching[j].Order
+		}
+		return matching[i].Preference < matching[j].Preference
+	})
+
+	var addrs []*Addr
+	for _, rec := range matching {
+		// The replacement is an SRV target; resolve it.
+		srvAddrs, err := r.resolveSRV(rec.Replacement, proto)
+		if err != nil {
+			continue
+		}
+		addrs = append(addrs, srvAddrs...)
+		if len(addrs) > 0 {
+			break
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, ErrNoNAPTR
+	}
+	return addrs, nil
 }
 
 // resolveSRV performs SRV lookup
