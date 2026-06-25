@@ -89,7 +89,9 @@ const (
 	// 3GPP vendor-id (10415) in the most-significant nibble for readability.
 	App3GPPSh uint32 = 16777217 // 0x01000001
 	// App3GPPCx is the 3GPP Cx interface application (3GPP TS 29.229).
-	App3GPPCx uint32 = 16777238 // 0x01000026
+	// C source: src/modules/cdp/diameter_ims_code_app.h:51 — IMS_Cx = 16777216.
+	// Same value is reused by 3GPP for the Dx interface (SLF lookup) per TS 29.229.
+	App3GPPCx uint32 = 16777216 // 0x01000000
 	// App3GPPRx is the 3GPP Rx interface application (3GPP TS 29.214).
 	App3GPPRx uint32 = 16777236 // 0x01000024
 )
@@ -133,6 +135,11 @@ const (
 	AVPCodeResultCode uint32 = 268
 	// AVPCodeExperimentalResult is the Experimental-Result AVP code.
 	AVPCodeExperimentalResult uint32 = 297
+	// AVPCodeExperimentalResultCode is the Experimental-Result-Code AVP
+	// code (RFC 6733 §7.6). Carried inside the Experimental-Result
+	// grouped AVP; the value range is vendor-specific (3GPP uses 2xxx
+	// for success, 4xxx for failures — see 3GPP TS 29.229 §6.4).
+	AVPCodeExperimentalResultCode uint32 = 298
 	// AVPCodeErrorReportingHost is the Error-Reporting-Host AVP code.
 	AVPCodeErrorReportingHost uint32 = 294
 	// AVPCodeErrorMessage is the Error-Message AVP code.
