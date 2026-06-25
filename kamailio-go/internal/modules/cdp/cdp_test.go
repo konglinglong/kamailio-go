@@ -70,7 +70,7 @@ func TestSend(t *testing.T) {
 	m.AddPeer(&DiameterPeer{Host: "h1", Connected: true})
 	req := &DiameterMessage{
 		Flags:         CmdFlagRequest,
-		CommandCode:   318, // Device-Watchdog
+		CommandCode:   CmdDeviceWatchdog, // 280, RFC 6733 §5.5
 		ApplicationID: 0,
 		HopByHopID:    1,
 		EndToEndID:    2,
@@ -109,7 +109,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	orig := &DiameterMessage{
 		Version:       Version,
 		Flags:         CmdFlagRequest | CmdFlagProxy,
-		CommandCode:   318,
+		CommandCode:   CmdDeviceWatchdog,
 		ApplicationID: 16777216,
 		HopByHopID:    0x11223344,
 		EndToEndID:    0x55667788,
@@ -206,6 +206,40 @@ func TestNextHopByHop(t *testing.T) {
 	}
 }
 
+func TestNextEndToEnd(t *testing.T) {
+	m := NewCDPModule()
+	a := m.NextEndToEnd()
+	b := m.NextEndToEnd()
+	if a == 0 {
+		t.Errorf("first NextEndToEnd = 0, want non-zero (RFC 6733 §6.2)")
+	}
+	if b != a+1 {
+		t.Errorf("NextEndToEnd not incrementing: %d then %d", a, b)
+	}
+	// The end-to-end seed should differ across module instances.
+	m2 := NewCDPModule()
+	c := m2.NextEndToEnd()
+	// Lower 20 bits of the seed are time-derived; there's a tiny window
+	// where m and m2 may share the same seed. Just ensure it's non-zero
+	// and increments.
+	if c == 0 {
+		t.Errorf("NextEndToEnd on fresh module = 0")
+	}
+	d := m2.NextEndToEnd()
+	if d != c+1 {
+		t.Errorf("NextEndToEnd not incrementing on fresh module: %d then %d", c, d)
+	}
+}
+
+func TestSeedEndToEndNonZero(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		s := seedEndToEnd()
+		if s == 0 {
+			t.Fatalf("seedEndToEnd() returned 0 on iteration %d", i)
+		}
+	}
+}
+
 func TestConcurrentAccess(t *testing.T) {
 	m := NewCDPModule()
 	m.AddPeer(&DiameterPeer{Host: "h1", Connected: true})
@@ -217,10 +251,11 @@ func TestConcurrentAccess(t *testing.T) {
 			m.AddPeer(&DiameterPeer{Host: "h1", Connected: true})
 			m.IsConnected("h1")
 			m.Peers()
-			m.Send("h1", &DiameterMessage{Flags: CmdFlagRequest, CommandCode: 318})
+			m.Send("h1", &DiameterMessage{Flags: CmdFlagRequest, CommandCode: CmdDeviceWatchdog})
 			enc := m.Encode(&DiameterMessage{CommandCode: 1, AVPs: []DiameterAVP{{Code: 1, Value: []byte("x")}}})
 			m.Decode(enc)
 			m.NextHopByHop()
+			m.NextEndToEnd()
 		}()
 	}
 	wg.Wait()

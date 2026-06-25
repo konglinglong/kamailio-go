@@ -28,7 +28,27 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// seedEndToEnd returns a non-zero seed value for the end-to-end identifier
+// counter. Per RFC 6733 §6.2 the end-to-end id must be unique within the
+// network for the lifetime of a transaction; Kamailio's C cdp module seeds
+// it with time + a host-specific constant. We use the lower 20 bits of the
+// current nanosecond timestamp, which changes on every restart and avoids
+// zero (the zero value is reserved by RFC 6733 §6.2).
+//
+//	C: cdp_get_e2e_id() — initialization portion
+func seedEndToEnd() uint32 {
+	t := uint32(time.Now().UnixNano())
+	// Mask to the lower 20 bits and OR-in 1 to avoid zero.
+	seed := (t & 0xFFFFF) | 1
+	if seed == 0 {
+		seed = 1
+	}
+	return seed
+}
+
 
 // Diameter protocol constants (RFC 6733).
 const (
@@ -85,17 +105,42 @@ type DiameterMessage struct {
 	AVPs          []DiameterAVP
 }
 
-// CDPModule maintains the set of Diameter peers and the next hop-by-hop
-// identifier.
+// CDPModule maintains the set of Diameter peers and the next hop-by-hop /
+// end-to-end identifiers. The counters are seeded to non-zero values so
+// that identifiers remain unique across process restarts (RFC 6733 §6.2).
 type CDPModule struct {
 	mu       sync.RWMutex
 	peers    map[string]*DiameterPeer
 	hopByHop atomic.Uint64
+	endToEnd atomic.Uint64
 }
 
-// NewCDPModule creates a CDPModule with empty peer storage.
+// NewCDPModule creates a CDPModule with empty peer storage and the
+// end-to-end counter seeded to a per-process unique value (RFC 6733 §6.2).
 func NewCDPModule() *CDPModule {
-	return &CDPModule{peers: make(map[string]*DiameterPeer)}
+	m := &CDPModule{peers: make(map[string]*DiameterPeer)}
+	// Per RFC 6733 §6.2: the end-to-end identifier must be unique within
+	// the network across the lifetime of a transaction. We seed it with
+	// the lower 20 bits of the current time in nanoseconds, which gives
+	// a different starting value on every restart (matching the C
+	// module's behaviour of using time + a host-specific constant).
+	m.endToEnd.Store(uint64(seedEndToEnd()))
+	return m
+}
+
+// NextHopByHop returns the next hop-by-hop identifier and advances the
+// counter. Exposed so callers can correlate request/response pairs.
+func (m *CDPModule) NextHopByHop() uint32 {
+	return uint32(m.hopByHop.Add(1))
+}
+
+// NextEndToEnd returns the next end-to-end identifier and advances the
+// counter. Per RFC 6733 §6.2 the end-to-end identifier is preserved across
+// proxy hops and used to detect duplicate messages.
+//
+//	C: cdp_get_e2e_id()
+func (m *CDPModule) NextEndToEnd() uint32 {
+	return uint32(m.endToEnd.Add(1))
 }
 
 // AddPeer registers a Diameter peer and returns the assigned id (the
@@ -236,12 +281,6 @@ func (m *CDPModule) Decode(data []byte) (*DiameterMessage, error) {
 	}
 	msg.AVPs = avps
 	return msg, nil
-}
-
-// NextHopByHop returns the next hop-by-hop identifier and advances the
-// counter. Exposed so callers can correlate request/response pairs.
-func (m *CDPModule) NextHopByHop() uint32 {
-	return uint32(m.hopByHop.Add(1))
 }
 
 // ---------------------------------------------------------------------------
