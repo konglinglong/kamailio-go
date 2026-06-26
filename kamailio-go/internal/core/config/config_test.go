@@ -198,3 +198,63 @@ ims:
 		t.Fatalf("flat fields not parsed: %+v", cfg.IMS)
 	}
 }
+
+func TestValidate_IMSRoleInvalid(t *testing.T) {
+	cfg := &Config{
+		Core: CoreConfig{Listen: []string{"udp:0.0.0.0:5060"}, LogLevel: "info", Workers: 1},
+		IMS:  IMSConfig{Enabled: true, Role: "foo", Realm: "home.net"},
+	}
+	report := cfg.ValidateStrict()
+	if !report.HasErrors() {
+		t.Fatalf("expected error for invalid role, got none")
+	}
+}
+
+func TestValidate_PCSCFMissingICSCFAddrCrossProcess(t *testing.T) {
+	cfg := &Config{
+		Core: CoreConfig{Listen: []string{"udp:0.0.0.0:5060"}, LogLevel: "info", Workers: 1},
+		IMS: IMSConfig{
+			Enabled: true,
+			Role:    "pcscf",
+			Realm:   "home.net",
+			PCSCF:   &PCSCFConfig{}, // no icscf_addr
+		},
+	}
+	report := cfg.ValidateStrict()
+	if !report.HasErrors() {
+		t.Fatalf("expected error for missing icscf_addr, got none")
+	}
+}
+
+func TestValidate_PCSCFOkWhenICSCFSameProcess(t *testing.T) {
+	cfg := &Config{
+		Core: CoreConfig{Listen: []string{"udp:0.0.0.0:5060"}, LogLevel: "info", Workers: 1},
+		IMS: IMSConfig{
+			Enabled: true,
+			Role:    "all",
+			Realm:   "home.net",
+			PCSCF:   &PCSCFConfig{}, // icscf_addr can be empty; loopback used
+			ICSCF:   &ICSCFConfig{Listen: []string{"udp:127.0.0.1:5061"}},
+		},
+	}
+	report := cfg.ValidateStrict()
+	if report.HasErrors() {
+		t.Fatalf("expected no error in all-mode loopback, got: %v", report.Errors)
+	}
+}
+
+func TestValidate_ICSCFDiameterPeersRequired(t *testing.T) {
+	cfg := &Config{
+		Core: CoreConfig{Listen: []string{"udp:0.0.0.0:5060"}, LogLevel: "info", Workers: 1},
+		IMS: IMSConfig{
+			Enabled: true,
+			Role:    "icscf",
+			Realm:   "home.net",
+			ICSCF:   &ICSCFConfig{SCSCFAddr: "sip:scscf.home.net:5060"}, // no diameter_peers
+		},
+	}
+	report := cfg.ValidateStrict()
+	if !report.HasErrors() {
+		t.Fatalf("expected error for missing diameter_peers, got none")
+	}
+}
