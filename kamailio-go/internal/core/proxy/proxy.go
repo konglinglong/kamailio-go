@@ -128,6 +128,10 @@ type ProxyCore struct {
 	avps      *avp.Store
 	registrar *registrar.Registrar
 	tmMgr     *tm.Manager
+
+	// cscfAdaptors holds IMS role handlers attached via SetCSCFAdaptors.
+	// Dispatch walks them in order before the generic registrar/tm path.
+	cscfAdaptors []CSCFAdaptor
 }
 
 // SetAccounting attaches an accounting service to the proxy. When non-nil,
@@ -235,6 +239,16 @@ func (p *ProxyCore) SetTM(m *tm.Manager) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.tmMgr = m
+}
+
+// SetCSCFAdaptors attaches IMS role adaptors. When non-empty, REGISTER and
+// INVITE dispatch walks the adaptors first; a declined adaptor (zero
+// ResponseAction) falls through to the next, and finally to the generic
+// registrar/tm path.
+func (p *ProxyCore) SetCSCFAdaptors(a []CSCFAdaptor) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cscfAdaptors = a
 }
 
 // SetMediaPipeline attaches a NAT/media rewrite pipeline. When attached,
