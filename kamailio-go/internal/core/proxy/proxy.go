@@ -1093,6 +1093,11 @@ func (p *ProxyCore) handlePublish(msg *parser.SIPMsg) ResponseAction {
 // dispatchRegister delegates REGISTER to the registrar module when one is
 // attached; otherwise it falls back to the built-in stub behaviour.
 func (p *ProxyCore) dispatchRegister(msg *parser.SIPMsg, src net.Addr) ResponseAction {
+	// IMS role adaptors first.
+	if act := p.dispatchRegisterViaCSCF(msg, src); act.Status != 0 || act.Target != "" || act.StopRouting {
+		return act
+	}
+
 	p.mu.RLock()
 	reg := p.registrar
 	p.mu.RUnlock()
@@ -1120,10 +1125,36 @@ func (p *ProxyCore) dispatchRegister(msg *parser.SIPMsg, src net.Addr) ResponseA
 	return ResponseAction{Status: 200, Reason: "OK"}
 }
 
+// dispatchRegisterViaCSCF walks attached CSCF adaptors in order. The first
+// one to return a terminal action (Status!=0, Target!="", or StopRouting)
+// wins. Returns the zero ResponseAction if all adaptors decline so that
+// dispatchRegister continues to the existing registrar/fallback path.
+func (p *ProxyCore) dispatchRegisterViaCSCF(msg *parser.SIPMsg, src net.Addr) ResponseAction {
+	p.mu.RLock()
+	adaptors := p.cscfAdaptors
+	p.mu.RUnlock()
+	if len(adaptors) == 0 {
+		return ResponseAction{}
+	}
+	ctx := context.Background()
+	for _, a := range adaptors {
+		act := a.HandleRegister(ctx, msg)
+		if applyCSCFAction(ResponseAction{}, act) {
+			return act
+		}
+	}
+	return ResponseAction{}
+}
+
 // dispatchInvite drives dialog creation and TM relay for INVITE requests.
 // After TM/dialog bookkeeping the request continues through the normal
 // forward/fork/media pipeline.
 func (p *ProxyCore) dispatchInvite(msg *parser.SIPMsg, src net.Addr) ResponseAction {
+	// IMS role adaptors first.
+	if act := p.dispatchInviteViaCSCF(msg, src); act.Status != 0 || act.Target != "" || act.StopRouting {
+		return act
+	}
+
 	if p.config.AuthRequired && !hasAuthHeader(msg) {
 		challenge := auth.BuildProxyAuthenticate(auth.ChallengeOptions{Realm: p.config.Realm})
 		return ResponseAction{
@@ -1156,6 +1187,26 @@ func (p *ProxyCore) dispatchInvite(msg *parser.SIPMsg, src net.Addr) ResponseAct
 	}
 
 	return ResponseAction{Status: 100, Reason: "Trying"}
+}
+
+// dispatchInviteViaCSCF walks attached CSCF adaptors in order for INVITE
+// requests. The first terminal action wins; otherwise the zero
+// ResponseAction is returned so dispatchInvite continues its existing path.
+func (p *ProxyCore) dispatchInviteViaCSCF(msg *parser.SIPMsg, src net.Addr) ResponseAction {
+	p.mu.RLock()
+	adaptors := p.cscfAdaptors
+	p.mu.RUnlock()
+	if len(adaptors) == 0 {
+		return ResponseAction{}
+	}
+	ctx := context.Background()
+	for _, a := range adaptors {
+		act := a.HandleInvite(ctx, msg)
+		if applyCSCFAction(ResponseAction{}, act) {
+			return act
+		}
+	}
+	return ResponseAction{}
 }
 
 // dispatchACK records the ACK on the matching dialog and drops it (no

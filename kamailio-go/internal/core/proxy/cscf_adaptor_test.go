@@ -71,3 +71,74 @@ func TestApplyCSCFAction_EmptyContinues(t *testing.T) {
 		t.Fatalf("applyCSCFAction returned true for empty (declined) action")
 	}
 }
+
+func TestDispatchRegister_RoutesToFirstAdaptor(t *testing.T) {
+	pcore := NewProxyCore(&ProxyConfig{Realm: "test"})
+	called := 0
+	a1 := &stubAdaptor{
+		role: RolePCSCF,
+		register: func(ctx context.Context, msg *parser.SIPMsg) ResponseAction {
+			called++
+			return ResponseAction{Status: 401, Reason: "Unauthorized", StopRouting: true}
+		},
+	}
+	a2 := &stubAdaptor{
+		role: RoleICSCF,
+		register: func(ctx context.Context, msg *parser.SIPMsg) ResponseAction {
+			t.Fatal("second adaptor should not be called when first returns terminal")
+			return ResponseAction{}
+		},
+	}
+	pcore.SetCSCFAdaptors([]CSCFAdaptor{a1, a2})
+
+	msg := mustBuildRegisterMsg(t, "sip:user@home.net")
+	act := pcore.dispatchRegisterViaCSCF(msg, nil)
+	if called != 1 {
+		t.Fatalf("adaptor1 called %d times, want 1", called)
+	}
+	if act.Status != 401 {
+		t.Fatalf("Status = %d, want 401", act.Status)
+	}
+}
+
+func TestDispatchRegister_FallsBackWhenAllDecline(t *testing.T) {
+	pcore := NewProxyCore(&ProxyConfig{Realm: "test"})
+	a1 := &stubAdaptor{role: RolePCSCF} // returns zero (decline)
+	pcore.SetCSCFAdaptors([]CSCFAdaptor{a1})
+
+	// Without a registrar attached, the fallback stub returns 200 (no auth).
+	// All adaptors decline, so dispatch falls through to the existing path.
+	msg := mustBuildRegisterMsg(t, "sip:user@home.net")
+	act := pcore.dispatchRegister(msg, nil)
+	if act.Status != 200 {
+		t.Fatalf("fallback Status = %d, want 200", act.Status)
+	}
+}
+
+func TestDispatchRegister_NoAdaptorsUsesExistingPath(t *testing.T) {
+	pcore := NewProxyCore(&ProxyConfig{Realm: "test"})
+	msg := mustBuildRegisterMsg(t, "sip:user@home.net")
+	act := pcore.dispatchRegister(msg, nil)
+	if act.Status != 200 {
+		t.Fatalf("Status = %d, want 200 (no auth fallback)", act.Status)
+	}
+}
+
+// mustBuildRegisterMsg builds a minimal REGISTER SIPMsg for tests using the
+// real parser entry point parser.ParseMsg([]byte).
+func mustBuildRegisterMsg(t *testing.T, uri string) *parser.SIPMsg {
+	t.Helper()
+	raw := "REGISTER sip:home.net SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 127.0.0.1:5060\r\n" +
+		"From: <" + uri + ">;tag=abc\r\n" +
+		"To: <" + uri + ">\r\n" +
+		"Call-ID: test-cid\r\n" +
+		"CSeq: 1 REGISTER\r\n" +
+		"Contact: <" + uri + ">\r\n" +
+		"Content-Length: 0\r\n\r\n"
+	msg, err := parser.ParseMsg([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse REGISTER: %v", err)
+	}
+	return msg
+}
