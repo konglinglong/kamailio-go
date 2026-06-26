@@ -53,7 +53,7 @@ func TestConfigSaveLoad(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Core.Workers = 16
 	cfg.IMS.Enabled = true
-	cfg.IMS.SCSCF = true
+	cfg.IMS.SCSCF_ = true
 
 	tmpFile := "/tmp/kamailio_test_config.yaml"
 	defer os.Remove(tmpFile)
@@ -76,7 +76,7 @@ func TestConfigSaveLoad(t *testing.T) {
 	if !loaded.IsIMSEnabled() {
 		t.Error("expected IMS enabled")
 	}
-	if !loaded.IMS.SCSCF {
+	if !loaded.IMS.SCSCF_ {
 		t.Error("expected S-CSCF enabled")
 	}
 }
@@ -110,5 +110,91 @@ func TestGetListenAddresses(t *testing.T) {
 	}
 	if addrs[0] != "udp:0.0.0.0:5060" {
 		t.Errorf("unexpected address: %s", addrs[0])
+	}
+}
+
+func TestIMSConfig_ResolveRole_FlagOverridesConfig(t *testing.T) {
+	cfg := &Config{IMS: IMSConfig{Enabled: true, Role: "all"}}
+	roles := cfg.IMS.ResolveRole("pcscf")
+	if len(roles) != 1 || roles[0] != RolePCSCF {
+		t.Fatalf("got %v, want [RolePCSCF]", roles)
+	}
+}
+
+func TestIMSConfig_ResolveRole_AllDefaultsToAll(t *testing.T) {
+	cfg := &Config{IMS: IMSConfig{Enabled: true}}
+	roles := cfg.IMS.ResolveRole("")
+	if len(roles) != 3 {
+		t.Fatalf("got %v, want 3 roles", roles)
+	}
+}
+
+func TestIMSConfig_ResolveRole_AllWithLegacyBooleans(t *testing.T) {
+	cfg := &Config{IMS: IMSConfig{Enabled: true, SCSCF_: true}}
+	roles := cfg.IMS.ResolveRole("")
+	// role==all + SCSCF_=true means only S-CSCF (legacy boolean override).
+	if len(roles) != 1 || roles[0] != RoleSCSCF {
+		t.Fatalf("got %v, want [RoleSCSCF]", roles)
+	}
+}
+
+func TestIMSConfig_ResolveRole_SingleRole(t *testing.T) {
+	cfg := &Config{IMS: IMSConfig{Enabled: true}}
+	for _, tc := range []struct {
+		flag string
+		want int
+	}{
+		{"pcscf", RolePCSCF},
+		{"icscf", RoleICSCF},
+		{"scscf", RoleSCSCF},
+	} {
+		roles := cfg.IMS.ResolveRole(tc.flag)
+		if len(roles) != 1 || roles[0] != tc.want {
+			t.Errorf("flag=%q got %v, want [%d]", tc.flag, roles, tc.want)
+		}
+	}
+}
+
+func TestIMSConfig_ListenFor_SingleRole(t *testing.T) {
+	cfg := &Config{
+		Core: CoreConfig{Listen: []string{"udp:0.0.0.0:5060"}},
+		IMS: IMSConfig{
+			Enabled: true,
+			PCSCF: &PCSCFConfig{Listen: []string{"udp:0.0.0.0:5061"}},
+		},
+	}
+	got := cfg.IMS.ListenFor([]int{RolePCSCF}, cfg.Core.Listen)
+	if len(got) != 1 || got[0] != "udp:0.0.0.0:5061" {
+		t.Fatalf("got %v, want [udp:0.0.0.0:5061]", got)
+	}
+}
+
+func TestIMSConfig_ListenFor_AllReusesCore(t *testing.T) {
+	cfg := &Config{
+		Core: CoreConfig{Listen: []string{"udp:0.0.0.0:5060"}},
+		IMS: IMSConfig{Enabled: true},
+	}
+	got := cfg.IMS.ListenFor([]int{RolePCSCF, RoleICSCF, RoleSCSCF}, cfg.Core.Listen)
+	if len(got) != 1 || got[0] != "udp:0.0.0.0:5060" {
+		t.Fatalf("got %v, want core.listen", got)
+	}
+}
+
+func TestIMSConfig_BackwardCompat_OldFlatFields(t *testing.T) {
+	// Old-style flat config (no per-role sections) must still parse.
+	yamlIn := []byte(`
+ims:
+  enabled: true
+  realm: home.net
+  scscf: true
+  aka_algorithm: AKAv1-MD5
+  default_expires: 3600
+`)
+	cfg, err := LoadFromBytes(yamlIn)
+	if err != nil {
+		t.Fatalf("LoadFromBytes: %v", err)
+	}
+	if cfg.IMS.Realm != "home.net" || !cfg.IMS.SCSCF_ {
+		t.Fatalf("flat fields not parsed: %+v", cfg.IMS)
 	}
 }

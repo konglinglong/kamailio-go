@@ -138,7 +138,7 @@ func (c *Config) ValidateStrict() *ValidationReport {
 				Message: "outside min/max range",
 			})
 		}
-		if !c.IMS.SCSCF && !c.IMS.PCSCF && !c.IMS.ICSCF {
+		if !c.IMS.SCSCF_ && !c.IMS.PCSCF_ && !c.IMS.ICSCF_ {
 			report.Warnings = append(report.Warnings, &ValidationError{
 				Field: "IMS",
 				Message: "IMS enabled but no role (scscf/pcscf/icscf) selected",
