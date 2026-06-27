@@ -1,0 +1,25 @@
+# Build artifacts
+bin/
+*.test
+*.out
+kamailio
+kamailio-*
+
+# Version control / metadata
+.git/
+.gitignore
+.github/
+
+# Editor / OS clutter
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Documentation and plans not needed in the image
+docs/
+*.md
+
+# Local state
+*.db
+*.sqlite

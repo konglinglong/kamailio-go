@@ -1,0 +1,58 @@
+# Kamailio-Go IMS split-deployment orchestration.
+#
+# Default profile: three independent role processes (pcscf/icscf/scscf)
+#   docker compose up                # build + start all three roles
+#   docker compose build             # build the image only
+#
+# All-in-one profile: single process running --role all
+#   docker compose --profile all up ims-all
+#
+# Inter-role traffic uses the compose service names (sip:icscf:5060 etc.)
+# as configured in configs/ims-docker-*.yaml. Override configs by mounting
+# a volume onto /etc/kamailio/configs.
+
+services:
+  pcscf:
+    build: .
+    image: kamailio-go:dev
+    command: ["run", "--role", "pcscf", "-f", "/etc/kamailio/configs/ims-docker-pcscf.yaml"]
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+    depends_on:
+      - icscf
+      - scscf
+    restart: unless-stopped
+
+  icscf:
+    build: .
+    image: kamailio-go:dev
+    command: ["run", "--role", "icscf", "-f", "/etc/kamailio/configs/ims-docker-icscf.yaml"]
+    ports:
+      - "5061:5060/udp"
+      - "5061:5060/tcp"
+    depends_on:
+      - scscf
+    restart: unless-stopped
+
+  scscf:
+    build: .
+    image: kamailio-go:dev
+    command: ["run", "--role", "scscf", "-f", "/etc/kamailio/configs/ims-docker-scscf.yaml"]
+    ports:
+      - "5062:5060/udp"
+      - "5062:5060/tcp"
+    restart: unless-stopped
+
+  # Single-process all-roles container (the --role all path). Mutually
+  # exclusive with the split services above — start it on its own:
+  #   docker compose --profile all up ims-all
+  ims-all:
+    profiles: ["all"]
+    build: .
+    image: kamailio-go:dev
+    command: ["run", "--role", "all", "-f", "/etc/kamailio/configs/ims-all.yaml"]
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+    restart: unless-stopped
