@@ -318,7 +318,10 @@ func BuildForwardRequest(request *SIPMsg, transport, proxyHost string, proxyPort
 	}
 
 	// Clone the request (does deep copy of headers and structure)
-	fwd := request.Clone()
+	fwd, err := request.Clone()
+	if err != nil {
+		return nil, fmt.Errorf("clone request: %w", err)
+	}
 
 	// 1. Decrement Max-Forwards (RFC 3261 §16.6 step 2)
 	if !fwd.DecrementMaxForwards() {

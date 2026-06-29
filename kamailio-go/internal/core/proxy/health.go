@@ -126,14 +126,14 @@ func (h *HealthServer) ListenAndServe(addr string) error {
 
 	h.mu.Lock()
 	h.listener = ln
-	h.mu.Unlock()
-
 	h.server = &http.Server{
 		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
+	h.mu.Unlock()
+
 	return h.server.Serve(ln)
 }
 

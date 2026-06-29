@@ -74,8 +74,10 @@ func ShutdownProxy(ctx context.Context, core *ProxyCore, health *HealthServer, e
 	select {
 	case <-done:
 	case <-ctx.Done():
+		mu.Lock()
 		result.TimedOut = true
 		result.Errors = append(result.Errors, fmt.Sprintf("shutdown context: %v", ctx.Err()))
+		mu.Unlock()
 	}
 
 	result.Duration = time.Since(start)

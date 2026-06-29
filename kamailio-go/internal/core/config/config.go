@@ -55,18 +55,89 @@ type CoreConfig struct {
 	MaxBufSize int      `yaml:"max_buffer_size,omitempty"`
 }
 
-// IMSConfig represents IMS-specific settings
+// CSCF role identifiers (mirror proxy.RolePCSCF/ICSCF/SCSCF to avoid an
+// import cycle between config and proxy).
+const (
+	RolePCSCF = iota
+	RoleICSCF
+	RoleSCSCF
+)
+
+// IMSConfig represents IMS-specific settings. It supports both the new
+// per-role section style (pcscf/icscf/scscf as maps) and the legacy flat
+// style (pcscf/icscf/scscf as booleans). The polymorphic pcscf/icscf/scscf
+// keys are handled by a custom UnmarshalYAML.
 type IMSConfig struct {
-	Enabled           bool   `yaml:"enabled"`
-	Realm             string `yaml:"realm"`
-	SCSCF             bool   `yaml:"scscf"`
-	PCSCF             bool   `yaml:"pcscf"`
-	ICSCF             bool   `yaml:"icscf"`
-	AKAAlgorithm      string `yaml:"aka_algorithm,omitempty"`
-	DefaultExpires    int    `yaml:"default_expires,omitempty"`
-	MinExpires        int    `yaml:"min_expires,omitempty"`
-	MaxExpires        int    `yaml:"max_expires,omitempty"`
-	VisitedNetworkID  string `yaml:"visited_network_id,omitempty"`
+	Enabled bool   `yaml:"enabled"`
+	Role    string `yaml:"role,omitempty"`
+	Realm   string `yaml:"realm,omitempty"`
+
+	PCSCF *PCSCFConfig `yaml:"pcscf,omitempty"`
+	ICSCF *ICSCFConfig `yaml:"icscf,omitempty"`
+	SCSCF *SCSCFConfig `yaml:"scscf,omitempty"`
+
+	SCSCF_ bool `yaml:"scscf,omitempty"`
+	PCSCF_ bool `yaml:"pcscf,omitempty"`
+	ICSCF_ bool `yaml:"icscf,omitempty"`
+
+	AKAAlgorithm     string `yaml:"aka_algorithm,omitempty"`
+	DefaultExpires   int    `yaml:"default_expires,omitempty"`
+	MinExpires       int    `yaml:"min_expires,omitempty"`
+	MaxExpires       int    `yaml:"max_expires,omitempty"`
+	VisitedNetworkID string `yaml:"visited_network_id,omitempty"`
+}
+
+// PCSCFConfig holds P-CSCF role-specific settings.
+type PCSCFConfig struct {
+	Listen           []string    `yaml:"listen,omitempty"`
+	Realm            string      `yaml:"realm,omitempty"`
+	VisitedNetworkID string      `yaml:"visited_network_id,omitempty"`
+	ICSCFAddr        string      `yaml:"icscf_addr,omitempty"`
+	SCSCFAddr        string      `yaml:"scscf_addr,omitempty"`
+	IPSEC            IPSECConfig `yaml:"ipsec,omitempty"`
+}
+
+// ICSCFConfig holds I-CSCF role-specific settings.
+type ICSCFConfig struct {
+	Listen            []string           `yaml:"listen,omitempty"`
+	Realm             string             `yaml:"realm,omitempty"`
+	DiameterPeers     []DiameterPeerConfig `yaml:"diameter_peers,omitempty"`
+	ForcedPeer        string             `yaml:"forced_peer,omitempty"`
+	SCSCFAddr         string             `yaml:"scscf_addr,omitempty"`
+	SCSCFCapabilities []SCSCFCapConfig   `yaml:"scscf_capabilities,omitempty"`
+	EntryExpiry       int                `yaml:"entry_expiry,omitempty"`
+	PreferredSCSCF    []string           `yaml:"preferred_scscf,omitempty"`
+}
+
+// SCSCFConfig holds S-CSCF role-specific settings.
+type SCSCFConfig struct {
+	Listen         []string             `yaml:"listen,omitempty"`
+	Realm          string               `yaml:"realm,omitempty"`
+	DiameterPeers  []DiameterPeerConfig `yaml:"diameter_peers,omitempty"`
+	AKAAlgorithm   string               `yaml:"aka_algorithm,omitempty"`
+	DefaultExpires int                  `yaml:"default_expires,omitempty"`
+	MinExpires     int                  `yaml:"min_expires,omitempty"`
+	MaxExpires     int                  `yaml:"max_expires,omitempty"`
+}
+
+// DiameterPeerConfig describes a single Diameter peer connection.
+type DiameterPeerConfig struct {
+	Host string `yaml:"host"`
+	IP   string `yaml:"ip"`
+	Port int    `yaml:"port"`
+}
+
+// SCSCFCapConfig describes an S-CSCF capability entry for I-CSCF selection.
+type SCSCFCapConfig struct {
+	ID            int    `yaml:"id"`
+	Name          string `yaml:"name"`
+	MandatoryCaps []int  `yaml:"mandatory_caps,omitempty"`
+	OptionalCaps  []int  `yaml:"optional_caps,omitempty"`
+}
+
+// IPSECConfig holds IPSec settings used by the P-CSCF.
+type IPSECConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // ModuleConfig represents a module configuration
@@ -103,9 +174,7 @@ func DefaultConfig() *Config {
 		IMS: IMSConfig{
 			Enabled:        false,
 			Realm:          "ims.mnc001.mcc460.gprs",
-			SCSCF:          false,
-			PCSCF:          false,
-			ICSCF:          false,
+			Role:           "",
 			AKAAlgorithm:   "AKAv1-MD5",
 			DefaultExpires: 3600,
 			MinExpires:     60,
@@ -148,6 +217,206 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// LoadFromBytes parses a YAML config from a byte slice, starting from the
+// DefaultConfig and applying the provided overlay. It performs the same
+// validation as Load.
+func LoadFromBytes(data []byte) (*Config, error) {
+	cfg := DefaultConfig()
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	return cfg, nil
+}
+
+// ResolveRole determines which CSCF roles this instance should run.
+// The flagRole (e.g. from --role) takes precedence over the configured
+// IMS.Role field. An empty role resolves to "all" unless one of the legacy
+// per-role booleans (SCSCF_/PCSCF_/ICSCF_) is set, in which case only the
+// explicitly-enabled roles are returned.
+func (c IMSConfig) ResolveRole(flagRole string) []int {
+	role := flagRole
+	if role == "" {
+		role = c.Role
+	}
+	if role == "" {
+		role = "all"
+	}
+	switch role {
+	case "pcscf":
+		return []int{RolePCSCF}
+	case "icscf":
+		return []int{RoleICSCF}
+	case "scscf":
+		return []int{RoleSCSCF}
+	case "all":
+		if c.SCSCF_ || c.PCSCF_ || c.ICSCF_ {
+			var out []int
+			if c.PCSCF_ {
+				out = append(out, RolePCSCF)
+			}
+			if c.ICSCF_ {
+				out = append(out, RoleICSCF)
+			}
+			if c.SCSCF_ {
+				out = append(out, RoleSCSCF)
+			}
+			return out
+		}
+		return []int{RolePCSCF, RoleICSCF, RoleSCSCF}
+	}
+	return nil
+}
+
+// ListenFor returns the listen addresses for the first role in roles that
+// has a per-role listen list configured. If none of the roles define their
+// own listen list, the core listen list is returned as a fallback.
+func (c IMSConfig) ListenFor(roles []int, coreListen []string) []string {
+	for _, r := range roles {
+		var sectionListen []string
+		switch r {
+		case RolePCSCF:
+			if c.PCSCF != nil {
+				sectionListen = c.PCSCF.Listen
+			}
+		case RoleICSCF:
+			if c.ICSCF != nil {
+				sectionListen = c.ICSCF.Listen
+			}
+		case RoleSCSCF:
+			if c.SCSCF != nil {
+				sectionListen = c.SCSCF.Listen
+			}
+		}
+		if len(sectionListen) > 0 {
+			return sectionListen
+		}
+	}
+	return coreListen
+}
+
+// UnmarshalYAML implements polymorphic decoding for the ims section. The
+// pcscf/icscf/scscf keys may be either a boolean (legacy flat style:
+// `scscf: true`) or a mapping (new per-role section style:
+// `scscf: {listen: [...]}`). The struct tags alone cannot express this
+// because the pointer and the legacy boolean share the same yaml key, so
+// we decode the polymorphic keys by inspecting the node kind and leave the
+// remaining scalar/map fields to a plain decode.
+func (c *IMSConfig) UnmarshalYAML(value *yaml.Node) error {
+	type plain struct {
+		Enabled          bool   `yaml:"enabled"`
+		Role             string `yaml:"role,omitempty"`
+		Realm            string `yaml:"realm,omitempty"`
+		AKAAlgorithm     string `yaml:"aka_algorithm,omitempty"`
+		DefaultExpires   int    `yaml:"default_expires,omitempty"`
+		MinExpires       int    `yaml:"min_expires,omitempty"`
+		MaxExpires       int    `yaml:"max_expires,omitempty"`
+		VisitedNetworkID string `yaml:"visited_network_id,omitempty"`
+	}
+	var p plain
+	// value.Decode ignores unknown keys (the polymorphic scscf/pcscf/icscf
+	// keys are not members of plain), so this populates only the flat fields.
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	c.Enabled = p.Enabled
+	c.Role = p.Role
+	c.Realm = p.Realm
+	c.AKAAlgorithm = p.AKAAlgorithm
+	c.DefaultExpires = p.DefaultExpires
+	c.MinExpires = p.MinExpires
+	c.MaxExpires = p.MaxExpires
+	c.VisitedNetworkID = p.VisitedNetworkID
+
+	// Decode the polymorphic pcscf/icscf/scscf keys by node kind.
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		keyNode := value.Content[i]
+		valNode := value.Content[i+1]
+		switch keyNode.Value {
+		case "scscf":
+			if valNode.Kind == yaml.ScalarNode {
+				c.SCSCF_ = valNode.Value == "true"
+			} else if valNode.Kind == yaml.MappingNode {
+				var s SCSCFConfig
+				if err := valNode.Decode(&s); err != nil {
+					return err
+				}
+				c.SCSCF = &s
+			}
+		case "pcscf":
+			if valNode.Kind == yaml.ScalarNode {
+				c.PCSCF_ = valNode.Value == "true"
+			} else if valNode.Kind == yaml.MappingNode {
+				var s PCSCFConfig
+				if err := valNode.Decode(&s); err != nil {
+					return err
+				}
+				c.PCSCF = &s
+			}
+		case "icscf":
+			if valNode.Kind == yaml.ScalarNode {
+				c.ICSCF_ = valNode.Value == "true"
+			} else if valNode.Kind == yaml.MappingNode {
+				var s ICSCFConfig
+				if err := valNode.Decode(&s); err != nil {
+					return err
+				}
+				c.ICSCF = &s
+			}
+		}
+	}
+	return nil
+}
+
+// MarshalYAML serializes IMSConfig without triggering yaml.v3's
+// "duplicated key" panic that would otherwise arise from the pointer and
+// legacy boolean sharing the scscf/pcscf/icscf tags. Each polymorphic key
+// is emitted once: as the per-role mapping when the pointer is set, as the
+// boolean `true` when only the legacy flag is set, and omitted otherwise.
+func (c IMSConfig) MarshalYAML() (interface{}, error) {
+	type out struct {
+		Enabled          bool        `yaml:"enabled"`
+		Role             string      `yaml:"role,omitempty"`
+		Realm            string      `yaml:"realm,omitempty"`
+		PCSCF            interface{} `yaml:"pcscf,omitempty"`
+		ICSCF            interface{} `yaml:"icscf,omitempty"`
+		SCSCF            interface{} `yaml:"scscf,omitempty"`
+		AKAAlgorithm     string      `yaml:"aka_algorithm,omitempty"`
+		DefaultExpires   int         `yaml:"default_expires,omitempty"`
+		MinExpires       int         `yaml:"min_expires,omitempty"`
+		MaxExpires       int         `yaml:"max_expires,omitempty"`
+		VisitedNetworkID string      `yaml:"visited_network_id,omitempty"`
+	}
+	o := out{
+		Enabled:          c.Enabled,
+		Role:             c.Role,
+		Realm:            c.Realm,
+		AKAAlgorithm:     c.AKAAlgorithm,
+		DefaultExpires:   c.DefaultExpires,
+		MinExpires:       c.MinExpires,
+		MaxExpires:       c.MaxExpires,
+		VisitedNetworkID: c.VisitedNetworkID,
+	}
+	if c.PCSCF != nil {
+		o.PCSCF = c.PCSCF
+	} else if c.PCSCF_ {
+		o.PCSCF = true
+	}
+	if c.ICSCF != nil {
+		o.ICSCF = c.ICSCF
+	} else if c.ICSCF_ {
+		o.ICSCF = true
+	}
+	if c.SCSCF != nil {
+		o.SCSCF = c.SCSCF
+	} else if c.SCSCF_ {
+		o.SCSCF = true
+	}
+	return o, nil
 }
 
 // Validate validates the configuration

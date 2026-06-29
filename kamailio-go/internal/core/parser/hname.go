@@ -284,9 +284,16 @@ type HdrField struct {
 	Len        int         // total header length including CRLF
 }
 
-// ParseHeaders parses all headers from the given buffer
-// Returns headers list, body offset, and error
-func ParseHeaders(buf []byte) ([]*HdrField, int, error) {
+// ParseHeaders parses all headers from the given buffer.
+//
+// baseOffset is the offset of buf[0] within the original message buffer;
+// it is added to each header's Offset so that HdrField.Offset is absolute
+// with respect to the full message buffer (matching C semantics where
+// header offsets point into msg->buf). Pass 0 when buf is the entire
+// message.
+//
+// Returns headers list, body offset (relative to buf), and error.
+func ParseHeaders(buf []byte, baseOffset int) ([]*HdrField, int, error) {
 	var headers []*HdrField
 	var lastHeader *HdrField
 
@@ -340,6 +347,11 @@ func ParseHeaders(buf []byte) ([]*HdrField, int, error) {
 			Name: str.Str{S: buf[pos:], Len: nameLen},
 			Body: str.Str{S: buf[pos+bodyOffsetTrimmed:], Len: len(bodyTrimmed)},
 			Type: hdrType,
+			// Absolute offset into the original message buffer and total
+			// header length including the trailing CRLF, matching the
+			// C struct hdr_field offset/len fields.
+			Offset: baseOffset + pos,
+			Len:    lineEnd + 2 - pos,
 		}
 
 		// For Via headers, eagerly parse the body and cache it in h.Parsed.

@@ -145,28 +145,34 @@ func TestTimerManager_StartAndStop(t *testing.T) {
 }
 
 func TestTimerManager_Expire(t *testing.T) {
-	var expiredID string
+	expiredCh := make(chan string, 1)
 	tm := NewTimerManager(nil, func(id string) {
-		expiredID = id
+		expiredCh <- id
 	})
 	tm.StartLifetimeTimer("dlg-expire", 50*time.Millisecond)
-	time.Sleep(100 * time.Millisecond)
-	if expiredID != "dlg-expire" {
-		t.Errorf("expected dlg-expire, got %q", expiredID)
+	select {
+	case expiredID := <-expiredCh:
+		if expiredID != "dlg-expire" {
+			t.Errorf("expected dlg-expire, got %q", expiredID)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("timer did not expire in time")
 	}
 }
 
 func TestTimerManager_Refresh(t *testing.T) {
-	var expiredID string
+	expiredCh := make(chan string, 1)
 	tm := NewTimerManager(nil, func(id string) {
-		expiredID = id
+		expiredCh <- id
 	})
 	tm.StartLifetimeTimer("dlg-refresh", 100*time.Millisecond)
 	time.Sleep(30 * time.Millisecond)
 	tm.RefreshTimer("dlg-refresh")
-	time.Sleep(50 * time.Millisecond)
-	if expiredID != "" {
+	select {
+	case <-expiredCh:
 		t.Error("expected timer not to expire after refresh")
+	case <-time.After(80 * time.Millisecond):
+		// Good - timer hasn't fired yet (was refreshed)
 	}
 }
 

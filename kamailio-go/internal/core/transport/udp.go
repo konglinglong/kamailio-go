@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamailio/kamailio-go/internal/core/log"
@@ -36,7 +37,7 @@ type UDPListener struct {
 	conn     *net.UDPConn
 	handler  MessageHandler
 	bufSize  int
-	running  bool
+	running  atomic.Bool
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 }
@@ -62,7 +63,7 @@ func (u *UDPListener) ListenAndServe() error {
 	}
 	
 	u.conn = conn
-	u.running = true
+	u.running.Store(true)
 	
 	log.Info("UDP listener started",
 		log.String("address", addr.String()),
@@ -83,7 +84,7 @@ func (u *UDPListener) receiveLoop() {
 	
 	buf := make([]byte, u.bufSize)
 	
-	for u.running {
+	for u.running.Load() {
 		// Set read deadline to allow checking stopCh periodically
 		u.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		
@@ -165,11 +166,11 @@ func (u *UDPListener) SendTo(di *DestInfo, data []byte) error {
 
 // Shutdown stops the UDP listener
 func (u *UDPListener) Shutdown(ctx context.Context) error {
-	if !u.running {
+	if !u.running.Load() {
 		return nil
 	}
 	
-	u.running = false
+	u.running.Store(false)
 	close(u.stopCh)
 	
 	if u.conn != nil {

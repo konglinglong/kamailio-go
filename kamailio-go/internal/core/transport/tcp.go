@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamailio/kamailio-go/internal/core/log"
@@ -36,7 +37,7 @@ type TCPListener struct {
 	si       *SocketInfo
 	listener net.Listener
 	handler  TCPMessageHandler
-	running  bool
+	running  atomic.Bool
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 	conns    sync.Map // map[*TCPConnection]bool
@@ -61,7 +62,7 @@ func (t *TCPListener) ListenAndServe() error {
 	}
 
 	t.listener = listener
-	t.running = true
+	t.running.Store(true)
 
 	log.Info("TCP listener started",
 		log.String("address", addr.String()),
@@ -86,7 +87,7 @@ func (t *TCPListener) LocalAddr() net.Addr {
 func (t *TCPListener) acceptLoop() {
 	defer t.wg.Done()
 
-	for t.running {
+	for t.running.Load() {
 		// Set accept deadline to allow checking stopCh
 		t.listener.(*net.TCPListener).SetDeadline(time.Now().Add(100 * time.Millisecond))
 
@@ -142,7 +143,7 @@ func (t *TCPListener) handleConnection(conn net.Conn) {
 
 	// Read loop
 	reader := bufio.NewReader(conn)
-	for t.running {
+	for t.running.Load() {
 		conn.SetReadDeadline(time.Now().Add(TCPReadTimeout))
 
 		// For SIP over TCP, messages are delimited by Content-Length
@@ -282,11 +283,11 @@ func matchCI(data, prefix []byte) bool {
 
 // Shutdown stops the TCP listener
 func (t *TCPListener) Shutdown(ctx context.Context) error {
-	if !t.running {
+	if !t.running.Load() {
 		return nil
 	}
 
-	t.running = false
+	t.running.Store(false)
 	close(t.stopCh)
 
 	// Close all connections

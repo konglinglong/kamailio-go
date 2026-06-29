@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/kamailio/kamailio-go/internal/core/avp"
 	"github.com/kamailio/kamailio-go/internal/core/log"
 	"github.com/kamailio/kamailio-go/internal/core/parser"
 )
@@ -36,10 +37,19 @@ type ExecContext struct {
 	Drop   bool
 	Return bool
 
+	// breakFlag is set by the break statement inside switch/while.
+	// It is checked by runBlock and cleared by the enclosing
+	// switch/while handler so it does not leak to outer blocks.
+	breakFlag bool
+
 	// $var(name) store — protected by mu.
 	mu   *sync.RWMutex
 	Vars map[string]string
 	Logs []string
+
+	// AVP and XAVP stores (used by lvalue.go assignments).
+	AVPs   *avp.Store
+	XAVPs  *XAVPStore
 }
 
 // ReplyAction records a script's decision to reply to a request with a
@@ -59,6 +69,8 @@ func NewExecContext(msg *parser.SIPMsg, src net.Addr, realm string) *ExecContext
 		Realm:   realm,
 		mu:      &sync.RWMutex{},
 		Vars:    make(map[string]string),
+		AVPs:    avp.NewStore(),
+		XAVPs:   NewXAVPStore(),
 	}
 	if msg != nil && msg.FirstLine != nil && msg.FirstLine.Req != nil {
 		ctx.RURI = msg.FirstLine.Req.URI.String()
@@ -75,10 +87,10 @@ func (s *Script) Execute(ctx *ExecContext) error {
 }
 
 // runBlock executes a slice of actions sequentially. It stops early if
-// the script requests a reply, a drop, or a return.
+// the script requests a reply, a drop, a return, or a break.
 func (s *Script) runBlock(actions []*Action, ctx *ExecContext) error {
 	for _, a := range actions {
-		if ctx.Reply != nil || ctx.Drop || ctx.Return {
+		if ctx.Reply != nil || ctx.Drop || ctx.Return || ctx.breakFlag {
 			return nil
 		}
 		if err := s.runOne(a, ctx); err != nil {
@@ -148,6 +160,67 @@ func (s *Script) runOne(a *Action, ctx *ExecContext) error {
 		return s.runBlock(block, ctx)
 	case ActReturn:
 		ctx.Return = true
+	case ActBreak:
+		ctx.breakFlag = true
+	case ActSwitch:
+		if a.Switch != nil {
+			return s.evalSwitch(a.Switch, ctx)
+		}
+	}
+	return nil
+}
+
+// evalSwitch executes a switch statement in the Script.Execute path.
+// Unlike EvalSwitch (which uses DoAction and cannot dispatch routes),
+// this method uses runBlock so that route() calls inside cases work.
+// Break is handled via ctx.breakFlag, which is cleared here so it
+// does not leak to the enclosing block.
+func (s *Script) evalSwitch(sw *SwitchStmt, ctx *ExecContext) error {
+	if sw == nil {
+		return nil
+	}
+
+	val := evalSwitchValue(sw.Expr, ctx.Msg, ctx)
+
+	matchIdx := -1
+	defaultIdx := -1
+	for i, c := range sw.Cases {
+		if c.IsDefault {
+			if defaultIdx < 0 {
+				defaultIdx = i
+			}
+			continue
+		}
+		if matchIdx >= 0 {
+			continue
+		}
+		for _, v := range c.Values {
+			if v == val {
+				matchIdx = i
+				break
+			}
+		}
+	}
+
+	if matchIdx < 0 {
+		matchIdx = defaultIdx
+	}
+	if matchIdx < 0 {
+		return nil
+	}
+
+	for i := matchIdx; i < len(sw.Cases); i++ {
+		c := sw.Cases[i]
+		if err := s.runBlock(c.Actions, ctx); err != nil {
+			return err
+		}
+		if ctx.Reply != nil || ctx.Drop || ctx.Return {
+			return nil
+		}
+		if ctx.breakFlag {
+			ctx.breakFlag = false
+			return nil
+		}
 	}
 	return nil
 }

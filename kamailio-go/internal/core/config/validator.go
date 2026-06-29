@@ -138,13 +138,16 @@ func (c *Config) ValidateStrict() *ValidationReport {
 				Message: "outside min/max range",
 			})
 		}
-		if !c.IMS.SCSCF && !c.IMS.PCSCF && !c.IMS.ICSCF {
+		if !c.IMS.SCSCF_ && !c.IMS.PCSCF_ && !c.IMS.ICSCF_ {
 			report.Warnings = append(report.Warnings, &ValidationError{
 				Field: "IMS",
 				Message: "IMS enabled but no role (scscf/pcscf/icscf) selected",
 			})
 		}
 	}
+
+	// --- IMS role-specific rules ---
+	validateIMS(c, report)
 
 	// --- Flat overlays ---
 	if c.ListenPort < 0 || c.ListenPort > 65535 {
@@ -289,4 +292,81 @@ func splitN(s, sep string, n int) []string {
 		parts = append(parts, remaining)
 	}
 	return parts
+}
+
+// validateIMS checks IMS role configuration rules. Errors are appended to
+// the provided report. It enforces that each active role has the cross-role
+// references and diameter peers it needs, relaxing the requirement when the
+// referenced role is co-located in the same process (all mode).
+func validateIMS(cfg *Config, report *ValidationReport) {
+	if !cfg.IMS.Enabled {
+		return
+	}
+	roles := cfg.IMS.ResolveRole("")
+	if len(roles) == 0 {
+		// ResolveRole returns nil only for an explicit invalid role string.
+		report.Errors = append(report.Errors, &ValidationError{
+			Field:   "ims.role",
+			Message: "must be one of pcscf|scscf|icscf|all",
+		})
+		return
+	}
+	allMode := len(roles) == 3
+	for _, r := range roles {
+		switch r {
+		case RolePCSCF:
+			if cfg.IMS.PCSCF == nil {
+				cfg.IMS.PCSCF = &PCSCFConfig{}
+			}
+			// icscf_addr required unless ICSCF is also in-process (all mode).
+			if cfg.IMS.PCSCF.ICSCFAddr == "" {
+				if !(allMode && containsRole(roles, RoleICSCF)) {
+					report.Errors = append(report.Errors, &ValidationError{
+						Field:   "ims.pcscf.icscf_addr",
+						Message: "required when icscf role is not co-located",
+					})
+				}
+			}
+		case RoleICSCF:
+			if cfg.IMS.ICSCF == nil {
+				cfg.IMS.ICSCF = &ICSCFConfig{}
+			}
+			// scscf_addr required unless SCSCF is also in-process.
+			if cfg.IMS.ICSCF.SCSCFAddr == "" {
+				if !(allMode && containsRole(roles, RoleSCSCF)) {
+					report.Errors = append(report.Errors, &ValidationError{
+						Field:   "ims.icscf.scscf_addr",
+						Message: "required when scscf role is not co-located",
+					})
+				}
+			}
+			// diameter_peers required for standalone icscf.
+			if !allMode && len(cfg.IMS.ICSCF.DiameterPeers) == 0 {
+				report.Errors = append(report.Errors, &ValidationError{
+					Field:   "ims.icscf.diameter_peers",
+					Message: "required for standalone icscf",
+				})
+			}
+		case RoleSCSCF:
+			if cfg.IMS.SCSCF == nil {
+				cfg.IMS.SCSCF = &SCSCFConfig{}
+			}
+			if !allMode && len(cfg.IMS.SCSCF.DiameterPeers) == 0 {
+				report.Errors = append(report.Errors, &ValidationError{
+					Field:   "ims.scscf.diameter_peers",
+					Message: "required for standalone scscf",
+				})
+			}
+		}
+	}
+}
+
+// containsRole reports whether want is present in roles.
+func containsRole(roles []int, want int) bool {
+	for _, r := range roles {
+		if r == want {
+			return true
+		}
+	}
+	return false
 }

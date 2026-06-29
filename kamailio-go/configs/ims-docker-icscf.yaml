@@ -1,0 +1,29 @@
+core:
+  workers: 4
+  log_level: info
+  listen:
+    - "udp:0.0.0.0:5060"
+    - "tcp:0.0.0.0:5060"
+
+ims:
+  enabled: true
+  role: icscf
+  realm: home.net
+  icscf:
+    listen:
+      - "udp:0.0.0.0:5060"
+    realm: home.net
+    # HSS peer placeholder; override for real deployments.
+    diameter_peers:
+      - host: hss.home.net
+        ip: 10.0.0.5
+        port: 3868
+    forced_peer: ""
+    scscf_addr: "sip:scscf:5060"
+    scscf_capabilities:
+      - id: 1
+        name: "sip:scscf:5060"
+        mandatory_caps: [1]
+        optional_caps: [2, 3]
+    entry_expiry: 300
+    preferred_scscf: []

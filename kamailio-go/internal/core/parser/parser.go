@@ -35,8 +35,10 @@ func ParseMsg(buf []byte) (*SIPMsg, error) {
 	}
 	msg.FirstLine = fl
 
-	// Parse headers
-	headers, bodyOffset, err := ParseHeaders(remaining)
+	// Parse headers. Pass the offset of `remaining` within buf so that
+	// HdrField.Offset is absolute with respect to the full message buffer.
+	headersBase := len(buf) - len(remaining)
+	headers, bodyOffset, err := ParseHeaders(remaining, headersBase)
 	if err != nil {
 		return nil, fmt.Errorf("header parse error: %w", err)
 	}
