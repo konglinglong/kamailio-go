@@ -1,0 +1,65 @@
+# Kamailio-Go — all-in-one IMS configuration.
+#
+# Single-process deployment: one binary runs P-CSCF, I-CSCF and S-CSCF
+# together (launched with `--role all`). Inter-role forwarding uses the
+# in-process loopback path, so icscf_addr / scscf_addr are left empty.
+#
+# Used by the `ims-all` service in docker-compose.yml:
+#   docker compose --profile all up ims-all
+
+core:
+  workers: 4
+  log_level: info
+  listen:
+    - "udp:0.0.0.0:5060"
+    - "tcp:0.0.0.0:5060"
+
+ims:
+  enabled: true
+  role: all
+  realm: home.net
+
+  pcscf:
+    listen:
+      - "udp:0.0.0.0:5060"
+    realm: home.net
+    visited_network_id: visited.home.net
+    # Empty addrs → in-process loopback forwarding to local I/S-CSCF.
+    icscf_addr: ""
+    scscf_addr: ""
+    ipsec:
+      enabled: false
+
+  icscf:
+    listen:
+      - "udp:0.0.0.0:5060"
+    realm: home.net
+    # HSS peer placeholder; override for real deployments.
+    diameter_peers:
+      - host: hss.home.net
+        ip: 10.0.0.5
+        port: 3868
+    forced_peer: ""
+    # Empty scscf_addr → local S-CSCF selection via in-process path.
+    scscf_addr: ""
+    scscf_capabilities:
+      - id: 1
+        name: "sip:scscf:5060"
+        mandatory_caps: [1]
+        optional_caps: [2, 3]
+    entry_expiry: 300
+    preferred_scscf: []
+
+  scscf:
+    listen:
+      - "udp:0.0.0.0:5060"
+    realm: home.net
+    # HSS peer placeholder; override for real deployments.
+    diameter_peers:
+      - host: hss.home.net
+        ip: 10.0.0.5
+        port: 3868
+    aka_algorithm: AKAv1-MD5
+    default_expires: 3600
+    min_expires: 60
+    max_expires: 86400
