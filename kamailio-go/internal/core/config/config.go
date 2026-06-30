@@ -27,6 +27,12 @@ type Config struct {
 	Modules  []ModuleConfig `yaml:"modules,omitempty"`
 	Routes   RouteConfig    `yaml:"routes,omitempty"`
 
+	// CDR streaming backends. When enabled, finalised CDRs are
+	// published to the configured Kafka/RabbitMQ destination in
+	// addition to any locally-attached backends.
+	Kafka    KafkaConfig    `yaml:"kafka,omitempty"`
+	RabbitMQ RabbitMQConfig `yaml:"rabbitmq,omitempty"`
+
 	// Flat fields for simple key/value configuration overlays used by
 	// the boot manager.
 	ListenIP         string `yaml:"listen_ip,omitempty"`
@@ -40,6 +46,30 @@ type Config struct {
 	NATEnabled       bool   `yaml:"nat_enabled,omitempty"`
 	PresenceEnabled  bool   `yaml:"presence_enabled,omitempty"`
 	HealthListenAddr string `yaml:"health_listen_addr,omitempty"`
+}
+
+// KafkaConfig configures the Kafka CDR streaming backend. When Enabled
+// is true the bootstrap constructs a KafkaModule, connects it to
+// Brokers, and attaches a CDRBackend to the AccountingService so
+// finalised CDRs are published (as JSON) to Topic.
+type KafkaConfig struct {
+	Enabled bool     `yaml:"enabled"`
+	Brokers []string `yaml:"brokers,omitempty"`
+	Topic   string   `yaml:"topic,omitempty"`
+	GroupID string   `yaml:"group_id,omitempty"`
+}
+
+// RabbitMQConfig configures the RabbitMQ CDR streaming backend. When
+// Enabled is true the bootstrap constructs a RabbitMQModule, connects
+// it to URL, declares Queue and binds it to Exchange with RoutingKey,
+// then attaches a CDRBackend to the AccountingService so finalised
+// CDRs are published (as JSON) to that exchange.
+type RabbitMQConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	URL        string `yaml:"url,omitempty"`
+	Exchange   string `yaml:"exchange,omitempty"`
+	Queue      string `yaml:"queue,omitempty"`
+	RoutingKey string `yaml:"routing_key,omitempty"`
 }
 
 // CoreConfig represents core server settings

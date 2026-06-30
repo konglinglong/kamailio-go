@@ -21,25 +21,28 @@ import (
 
 // CDR represents one call-detail record produced for a single
 // request/reply flow.
+//
+// JSON tags make the wire format idiomatic (snake_case) when CDRs are
+// streamed to external systems via the kafka/rabbitmq backends.
 type CDR struct {
-	CallID      string
-	FromUser    string
-	FromDomain  string
-	ToUser      string
-	ToDomain    string
-	RequestURI  string
-	SourceIP    string
-	Destination string
-	Method      string
-	StatusCode  int
-	Reason      string
-	Direction   string
-	InviteTime  time.Time
-	ConnectTime time.Time
-	EndTime     time.Time
-	DurationSec int
-	RTPEngineID string
-	Extra       map[string]string
+	CallID      string            `json:"call_id"`
+	FromUser    string            `json:"from_user"`
+	FromDomain  string            `json:"from_domain"`
+	ToUser      string            `json:"to_user"`
+	ToDomain    string            `json:"to_domain"`
+	RequestURI  string            `json:"request_uri"`
+	SourceIP    string            `json:"source_ip"`
+	Destination string            `json:"destination"`
+	Method      string            `json:"method"`
+	StatusCode  int               `json:"status_code"`
+	Reason      string            `json:"reason"`
+	Direction   string            `json:"direction"`
+	InviteTime  time.Time         `json:"invite_time"`
+	ConnectTime time.Time         `json:"connect_time"`
+	EndTime     time.Time         `json:"end_time"`
+	DurationSec int               `json:"duration_sec"`
+	RTPEngineID string            `json:"rtp_engine_id,omitempty"`
+	Extra       map[string]string `json:"extra,omitempty"`
 }
 
 // Backend writes CDRs to a persistent destination. Multiple backends
