@@ -10,14 +10,20 @@ GOVET=$(GOCMD) vet
 
 # Binary output
 BINARY_NAME=kamailio
+KAMCTL_NAME=kamctl
+KAMCMD_NAME=kamcmd
 BINARY_DIR=bin
 BINARY_PATH=$(BINARY_DIR)/$(BINARY_NAME)
+KAMCTL_PATH=$(BINARY_DIR)/$(KAMCTL_NAME)
+KAMCMD_PATH=$(BINARY_DIR)/$(KAMCMD_NAME)
 
 # Build flags
 LDFLAGS=-ldflags "-s -w"
 
 # Directories
 CMD_DIR=cmd/kamailio
+KAMCTL_DIR=cmd/kamctl
+KAMCMD_DIR=cmd/kamcmd
 PKG_DIR=internal
 
 .PHONY: all build dev test bench clean fmt vet tidy
@@ -29,11 +35,15 @@ all: build
 dev:
 	@mkdir -p $(BINARY_DIR)
 	$(GOBUILD) -o $(BINARY_PATH) $(CMD_DIR)
+	$(GOBUILD) -o $(KAMCTL_PATH) $(KAMCTL_DIR)
+	$(GOBUILD) -o $(KAMCMD_PATH) $(KAMCMD_DIR)
 
 # Production build
 build:
 	@mkdir -p $(BINARY_DIR)
 	CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o $(BINARY_PATH) $(CMD_DIR)
+	CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o $(KAMCTL_PATH) $(KAMCTL_DIR)
+	CGO_ENABLED=0 $(GOBUILD) $(LDFLAGS) -o $(KAMCMD_PATH) $(KAMCMD_DIR)
 
 # Run tests
 test:

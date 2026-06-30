@@ -28,7 +28,9 @@ import (
 	"github.com/kamailio/kamailio-go/internal/core/msilo"
 	"github.com/kamailio/kamailio-go/internal/core/pike"
 	"github.com/kamailio/kamailio-go/internal/core/proxy"
+	"github.com/kamailio/kamailio-go/internal/core/registrar"
 	"github.com/kamailio/kamailio-go/internal/core/script"
+	"github.com/kamailio/kamailio-go/internal/core/usrloc"
 )
 
 // ServerConfig captures the subsystem dependencies for a Server. Any
@@ -41,6 +43,7 @@ type ServerConfig struct {
 	HTables *htable.Manager
 	Msilo   *msilo.Msilo
 	Acc     *acc.AccountingService
+	Usrloc  *registrar.Registrar
 }
 
 // Server exposes a JSON-RPC 2.0 HTTP endpoint. Handlers are registered
@@ -54,6 +57,7 @@ type Server struct {
 	pike       *pike.Pike
 	htables    *htable.Manager
 	msilo      *msilo.Msilo
+	usrloc     *registrar.Registrar
 	httpServer *http.Server
 	listener   atomic.Value
 	handler    *http.ServeMux
@@ -78,6 +82,7 @@ func NewExtended(cfg ServerConfig) *Server {
 		pike:    cfg.Pike,
 		htables: cfg.HTables,
 		msilo:   cfg.Msilo,
+		usrloc:  cfg.Usrloc,
 		handler: http.NewServeMux(),
 	}
 	s.handler.HandleFunc("/rpc", s.handleRPC)
@@ -217,6 +222,12 @@ type JSONRPCResponse struct {
 type RPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// Error implements the error interface so RPCError values can be
+// returned directly from Client.Call.
+func (e *RPCError) Error() string {
+	return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message)
 }
 
 // Standard JSON-RPC 2.0 error codes.
@@ -445,6 +456,104 @@ func (s *Server) dispatch(method string, params []interface{}) (interface{}, *me
 			out["metrics"] = s.core.MetricsSnapshot()
 		}
 		return out, nil
+
+	case "kamailio.ul.dump":
+		// Mirrors C's "ul.dump" operator command. With no params,
+		// dumps every domain; with one param, dumps only that domain.
+		if s.usrloc == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "usrloc/registrar not wired up"}
+		}
+		domainFilter := ""
+		if len(params) >= 1 {
+			if v, ok := params[0].(string); ok {
+				domainFilter = v
+			}
+		}
+		domains := []interface{}{}
+		_ = s.usrloc.ForEachDomain(func(domName string, d *usrloc.Domain) error {
+			if domainFilter != "" && domName != domainFilter {
+				return nil
+			}
+			aors := []interface{}{}
+			for _, aorKey := range d.AORs() {
+				aor := d.GetAOR(aorKey)
+				if aor == nil {
+					continue
+				}
+				contacts := []interface{}{}
+				for _, c := range aor.ActiveContacts() {
+					contacts = append(contacts, map[string]interface{}{
+						"uri":     c.URI,
+						"q":       c.Q,
+						"expires": c.Expires.Format(time.RFC3339),
+						"path":    c.Path,
+					})
+				}
+				aors = append(aors, map[string]interface{}{
+					"aor":      aorKey,
+					"contacts": contacts,
+				})
+			}
+			domains = append(domains, map[string]interface{}{
+				"name": domName,
+				"aors": aors,
+			})
+			return nil
+		})
+		return map[string]interface{}{
+			"ok":      true,
+			"domains": domains,
+		}, nil
+
+	case "kamailio.ul.lookup":
+		// Mirrors C's "ul.lookup <domain> <aor>". Returns the AOR's
+		// active contacts or {"found": false} when the AOR is unknown.
+		if s.usrloc == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "usrloc/registrar not wired up"}
+		}
+		if len(params) < 2 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [domain, aor]"}
+		}
+		domName, _ := params[0].(string)
+		aorKey, _ := params[1].(string)
+		aor := s.usrloc.LookupAOR(domName, aorKey)
+		if aor == nil {
+			return map[string]interface{}{"found": false}, nil
+		}
+		contacts := []interface{}{}
+		for _, c := range aor.ActiveContacts() {
+			contacts = append(contacts, map[string]interface{}{
+				"uri":     c.URI,
+				"q":       c.Q,
+				"expires": c.Expires.Format(time.RFC3339),
+				"path":    c.Path,
+			})
+		}
+		return map[string]interface{}{
+			"found":    true,
+			"domain":   domName,
+			"aor":      aorKey,
+			"contacts": contacts,
+		}, nil
+
+	case "kamailio.ul.rm":
+		// Mirrors C's "ul.rm <domain> <aor>". Removes the entire AOR
+		// (all its contacts) from the named domain.
+		if s.usrloc == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "usrloc/registrar not wired up"}
+		}
+		if len(params) < 2 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [domain, aor]"}
+		}
+		domName, _ := params[0].(string)
+		aorKey, _ := params[1].(string)
+		ok := s.usrloc.RemoveAOR(domName, aorKey)
+		return map[string]interface{}{
+			"ok":      ok,
+			"domain":  domName,
+			"aor":     aorKey,
+			"removed": ok,
+		}, nil
 	}
 	return nil, &methodErr{Code: ErrMethod, Message: fmt.Sprintf("method not found: %s", method)}
 }

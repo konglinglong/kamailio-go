@@ -261,6 +261,45 @@ func (d *Domain) AORCount() int {
 	return len(d.aors)
 }
 
+// AORs returns a snapshot of all AOR keys in this domain. The returned
+// slice is a copy and may be mutated by callers without holding the
+// domain lock.
+func (d *Domain) AORs() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]string, 0, len(d.aors))
+	for k := range d.aors {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RemoveAOR removes the entire AOR record (and all its contacts) from
+// this domain. Returns true if the AOR existed. If a Backend is
+// attached, contacts are removed from it as well; backend errors are
+// swallowed.
+func (d *Domain) RemoveAOR(aor string) bool {
+	d.mu.Lock()
+	a, ok := d.aors[aor]
+	if !ok {
+		d.mu.Unlock()
+		return false
+	}
+	delete(d.aors, aor)
+	d.mu.Unlock()
+
+	if d.backend != nil && a != nil {
+		a.mu.RLock()
+		contacts := append([]*Contact(nil), a.Contacts...)
+		a.mu.RUnlock()
+		for _, c := range contacts {
+			_ = d.backend.RemoveContact(d.Name, aor, c.URI)
+		}
+	}
+	return true
+}
+
 // TotalContactCount returns the total number of contacts (including expired).
 func (d *Domain) TotalContactCount() int {
 	d.mu.RLock()

@@ -186,6 +186,7 @@ func NewBootstrap(opts BootstrapOptions) (*Bootstrap, error) {
 			HTables: hm,
 			Msilo:   ms,
 			Acc:     ac,
+			Usrloc:  reg,
 		})
 		go func() {
 			_ = rpcServer.ListenAndServe(opts.RPCAddr)

@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -488,4 +489,73 @@ func (r *Registrar) clearAOR(domain *usrloc.Domain, aor string) {
 	for _, c := range rec.ActiveContacts() {
 		domain.RemoveContact(aor, c.URI)
 	}
+}
+
+// DomainNames returns a sorted snapshot of every domain known to the
+// registrar. Useful for kamctl-style "ul show" listings.
+func (r *Registrar) DomainNames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.domains))
+	for n := range r.domains {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ForEachDomain iterates over a snapshot of all known domains, calling
+// fn for each. Iteration stops on the first non-nil error returned by
+// fn. The snapshot is taken under the registrar read lock so callers
+// may safely mutate the returned Domain values.
+func (r *Registrar) ForEachDomain(fn func(name string, d *usrloc.Domain) error) error {
+	r.mu.RLock()
+	type domEntry struct {
+		name string
+		d    *usrloc.Domain
+	}
+	entries := make([]domEntry, 0, len(r.domains))
+	for n, d := range r.domains {
+		entries = append(entries, domEntry{name: n, d: d})
+	}
+	r.mu.RUnlock()
+	for _, e := range entries {
+		if err := fn(e.name, e.d); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LookupAOR returns the usrloc.AOR record for (domain, aor), or nil if
+// either the domain or the AOR is unknown.
+func (r *Registrar) LookupAOR(domain, aor string) *usrloc.AOR {
+	d := r.Domain(domain)
+	if d == nil {
+		return nil
+	}
+	return d.GetAOR(aor)
+}
+
+// RemoveAOR removes the entire AOR (all contacts) from the named
+// domain. Returns true if the AOR existed. Mirrors C's "ul rm <aor>"
+// operator command.
+func (r *Registrar) RemoveAOR(domain, aor string) bool {
+	d := r.Domain(domain)
+	if d == nil {
+		return false
+	}
+	ok := d.RemoveAOR(aor)
+	if ok {
+		r.mu.Lock()
+		aors := r.domainAORs[domain]
+		for i, a := range aors {
+			if a == aor {
+				r.domainAORs[domain] = append(aors[:i], aors[i+1:]...)
+				break
+			}
+		}
+		r.mu.Unlock()
+	}
+	return ok
 }

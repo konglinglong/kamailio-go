@@ -162,6 +162,7 @@ func NewFullStack(cfg FullStackConfig) (*FullStack, error) {
 			Pike:    fs.Pike,
 			HTables: fs.HTables,
 			Msilo:   fs.Msilo,
+			Usrloc:  reg,
 		})
 		addr := cfg.RPCEndpoint
 		go func() {
