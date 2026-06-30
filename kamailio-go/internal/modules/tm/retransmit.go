@@ -325,7 +325,7 @@ func (tm *TimerManager) handleRetransmit(cell *Cell, branch int, lastInterval ti
 // handleFRTimeout handles final response timeout.
 // Marks the transaction as timed out, stops all remaining timers (to
 // prevent handleRetransmit from firing after the cell is removed),
-// and schedules cleanup.
+// fires the branch/transaction failure TMCBs, and schedules cleanup.
 func (tm *TimerManager) handleFRTimeout(cell *Cell, branch int) {
 	cell.Lock()
 
@@ -343,8 +343,16 @@ func (tm *TimerManager) handleFRTimeout(cell *Cell, branch int) {
 	// scheduling new callbacks after we remove the cell.
 	tm.StopAllTimers(cell)
 
-	// Schedule cleanup via the manager
+	// Fire the per-branch failure event and the transaction-level
+	// failure event before removing the cell. A timed-out branch is
+	// a branch failure; if no other branch can rescue the transaction
+	// the whole transaction has failed. We fire both here (mirroring
+	// C's tmcb hook in fr_timer) - subscribers decide whether to
+	// generate a synthetic 408 or attempt serial forking.
 	if tm.manager != nil {
+		tm.manager.invokeTMCBs(TMCBOnBranchFailure, cell, branch, nil)
+		tm.manager.invokeTMCBs(TMCBOnFailure, cell, branch, nil)
+		// removeCell fires TMCBTransactionDestroyed as its last act.
 		tm.manager.removeCell(cell)
 	}
 }

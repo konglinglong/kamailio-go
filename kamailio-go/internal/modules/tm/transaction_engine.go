@@ -160,6 +160,12 @@ func (m *Manager) HandleRequest(msg *parser.SIPMsg) (*Cell, error) {
 		m.timerMgr.StartFRTimer(cell, 0)
 	}
 
+	// Fire TMCBRequestIn for newly created transactions. (CANCEL/ACK
+	// retransmissions go through LookupRequest above and do not create
+	// a new cell, so they don't fire this event - matching C, which
+	// only fires request_in for the initial request.)
+	m.invokeTMCBs(TMCBRequestIn, cell, -1, msg)
+
 	return cell, nil
 }
 
@@ -192,6 +198,11 @@ func (m *Manager) HandleResponse(msg *parser.SIPMsg) (*Cell, int, error) {
 	cell.UAS.Status = uint16(status)
 	cell.Unlock()
 
+	// Fire TMCBResponseIn before any on_reply processing so subscribers
+	// see the raw received reply regardless of how the state machine
+	// classifies it. This mirrors C's tmcb response_in hook.
+	m.invokeTMCBs(TMCBResponseIn, cell, branch, msg)
+
 	// Apply overall cell state based on response class. We drive the
 	// state towards the terminal TStateCompleted / TStateProceeding
 	// states regardless of whether the cell previously entered a
@@ -208,6 +219,7 @@ func (m *Manager) HandleResponse(msg *parser.SIPMsg) (*Cell, int, error) {
 		if cb := m.GetCallbacks(); cb.OnReply != nil {
 			cb.OnReply(cell, branch, msg)
 		}
+		m.invokeTMCBs(TMCBOnReply, cell, branch, msg)
 	case isFinalResponse(status):
 		cell.Lock()
 		cell.State = TStateCompleted
@@ -217,11 +229,17 @@ func (m *Manager) HandleResponse(msg *parser.SIPMsg) (*Cell, int, error) {
 		if cb := m.GetCallbacks(); cb.OnReply != nil {
 			cb.OnReply(cell, branch, msg)
 		}
+		m.invokeTMCBs(TMCBOnReply, cell, branch, msg)
 		// Trigger on_failure callback for non-2xx final responses
 		if !is2xx(status) {
 			if cb := m.GetCallbacks(); cb.OnFailure != nil {
 				cb.OnFailure(cell, branch, msg)
 			}
+			// A non-2xx final response also fails the branch that
+			// produced it: fire both the per-branch failure event
+			// and the transaction-level failure event.
+			m.invokeTMCBs(TMCBOnBranchFailure, cell, branch, msg)
+			m.invokeTMCBs(TMCBOnFailure, cell, branch, msg)
 		}
 
 		// Stop the FR/retransmit timers on final response and start
@@ -410,6 +428,11 @@ func (m *Manager) RelayRequest(msg *parser.SIPMsg, dstAddr string, dstPort int) 
 	uac.Flags |= 1 // mark as active branch
 	cell.Unlock()
 
+	// Fire TMCBOnBranch just before the request goes out on this
+	// branch. Subscribers can still mutate the outgoing buffer /
+	// destination here (Kamailio's t_on_branch semantics).
+	m.invokeTMCBs(TMCBOnBranch, cell, branch, msg)
+
 	// Move the cell to Calling state (request being forwarded)
 	if err := cell.UpdateState(TStateCalling); err != nil {
 		// It's acceptable if we cannot transition (e.g., already in
@@ -420,6 +443,10 @@ func (m *Manager) RelayRequest(msg *parser.SIPMsg, dstAddr string, dstPort int) 
 	if m.timerMgr != nil {
 		m.timerMgr.StartFRTimer(cell, branch)
 	}
+
+	// Fire TMCBRequestOut once the branch is fully wired and the
+	// timers are armed - subscribers see the request as committed.
+	m.invokeTMCBs(TMCBRequestOut, cell, branch, msg)
 
 	return cell, branch, nil
 }

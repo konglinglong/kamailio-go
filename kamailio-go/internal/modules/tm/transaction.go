@@ -30,6 +30,10 @@ type Manager struct {
 	timerMgr  *TimerManager
 	listeners []*transport.UDPListener
 	callbacks RouteCallbacks
+	// tmcb is the multi-subscriber callback registry. It fires
+	// alongside the single-slot callbacks above. Allocated lazily so
+	// a Manager that never registers TMCBs pays no allocation cost.
+	tmcb *CallbackRegistry
 }
 
 // NewManager creates a new transaction manager
@@ -52,6 +56,57 @@ func NewManagerWithTimers(tableSize uint32) *Manager {
 		mgr.timerMgr.SetManager(mgr)
 	}
 	return mgr
+}
+
+// TMCallbackRegistry returns the Manager's callback registry, creating
+// it on first access. Callers that want to subscribe to TM events
+// (replies, failures, branch failures, ...) should use
+// RegisterTMCallback instead - this accessor exists for tests and for
+// code that wants to query the registry directly.
+func (m *Manager) TMCallbackRegistry() *CallbackRegistry {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	if m.tmcb == nil {
+		m.tmcb = NewCallbackRegistry()
+	}
+	return m.tmcb
+}
+
+// RegisterTMCallback registers a callback for the given TM event mask.
+// data is passed back to the callback at fire time. Returns a handle
+// that can be passed to UnregisterTMCallback to remove the entry.
+//
+// This mirrors C's register_tmcb(). The Manager owns the registry;
+// multiple callbacks may be registered for the same event and all are
+// invoked (in registration order) when the event fires.
+func (m *Manager) RegisterTMCallback(typ TMCBType, cb TMCBCallback, data interface{}) int {
+	return m.TMCallbackRegistry().Register(typ, cb, data)
+}
+
+// UnregisterTMCallback removes a previously registered callback. A
+// handle of 0 or an unknown handle is a no-op.
+func (m *Manager) UnregisterTMCallback(handle int) {
+	m.mutex.RLock()
+	reg := m.tmcb
+	m.mutex.RUnlock()
+	if reg == nil {
+		return
+	}
+	reg.Unregister(handle)
+}
+
+// invokeTMCBs fires the given event type to every interested callback
+// in the registry. If no registry exists or no callback is interested,
+// this is a cheap no-op. Callers pass branch=-1 when the event is not
+// branch-specific and msg=nil for synthetic events.
+func (m *Manager) invokeTMCBs(typ TMCBType, cell *Cell, branch int, msg *parser.SIPMsg) {
+	m.mutex.RLock()
+	reg := m.tmcb
+	m.mutex.RUnlock()
+	if reg == nil || !reg.HasType(typ) {
+		return
+	}
+	reg.Invoke(typ, cell, branch, msg)
 }
 
 // TimerManager returns the integrated TimerManager, or nil if this
@@ -113,11 +168,14 @@ func (m *Manager) sendBuffer(data []byte, dst *net.UDPAddr) {
 }
 
 // removeCell removes a transaction cell from the table. Safe to call
-// from timer callbacks.
+// from timer callbacks. Fires TMCBTransactionDestroyed just before the
+// cell is detached so subscribers can release any per-transaction state
+// they captured (e.g. script route context, AVPs, dialog bindings).
 func (m *Manager) removeCell(cell *Cell) {
 	if cell == nil {
 		return
 	}
+	m.invokeTMCBs(TMCBTransactionDestroyed, cell, -1, nil)
 	m.table.Remove(cell)
 }
 
