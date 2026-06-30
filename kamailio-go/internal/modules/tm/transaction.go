@@ -327,6 +327,11 @@ func (m *Manager) NewTransaction(msg *parser.SIPMsg) (*Cell, error) {
 		CreatedAt: time.Now(),
 		State:     TStateTrying,
 	}
+	// Store the original request on the UAS so TMCB callbacks can
+	// access it later — e.g. to build replies from failure_route, or
+	// as the message fallback when the FR-timeout callback fires with
+	// msg=nil.
+	cell.UAS.Request = msg
 
 	// Extract key fields
 	if msg.From != nil {

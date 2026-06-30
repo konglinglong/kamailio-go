@@ -234,11 +234,175 @@ func (p *ProxyCore) SetRegistrar(r *registrar.Registrar) {
 }
 
 // SetTM attaches a transaction manager to the proxy. When non-nil, INVITE
-// and non-INVITE requests are tracked through the TM layer.
+// and non-INVITE requests are tracked through the TM layer, and persistent
+// TMCB callbacks are registered so that script route blocks bound via
+// t_on_reply / t_on_failure / t_on_branch are dispatched when the
+// corresponding TM event fires.
 func (p *ProxyCore) SetTM(m *tm.Manager) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.tmMgr = m
+	p.mu.Unlock()
+	if m != nil {
+		p.registerTMScriptCallbacks(m)
+	}
+}
+
+// registerTMScriptCallbacks installs persistent TMCB callbacks on the
+// transaction manager that bridge TM events to script route blocks.
+// Each callback reads the route name the script bound to the
+// transaction (via cell.OnReplyRoute / OnFailureRoute / OnBranchRoute,
+// populated from ctx.TMRoutes after the script runs in ProcessRequest)
+// and dispatches the named block through the script executor.
+//
+// The callbacks are registered once per Manager and apply to every
+// transaction; transactions whose route-name fields are empty are
+// skipped cheaply.
+func (p *ProxyCore) registerTMScriptCallbacks(m *tm.Manager) {
+	// data carries a back-reference to the proxy so the callback can
+	// reach the script and listeners. Per-transaction state (route
+	// names, source address) lives on the cell.
+	m.RegisterTMCallback(tm.TMCBOnReply, p.onReplyTMCB, p)
+	m.RegisterTMCallback(tm.TMCBOnFailure, p.onFailureTMCB, p)
+	m.RegisterTMCallback(tm.TMCBOnBranch, p.onBranchTMCB, p)
+}
+
+// onReplyTMCB dispatches the onreply_route block bound to the
+// transaction when a reply is received (provisional or final).
+func (p *ProxyCore) onReplyTMCB(cell *tm.Cell, branch int, msg *parser.SIPMsg, data interface{}) {
+	proxy, ok := data.(*ProxyCore)
+	if !ok || proxy == nil {
+		return
+	}
+	onReply, _, _ := cell.TMRoutes()
+	if onReply == "" {
+		return
+	}
+	proxy.dispatchTMRoute(cell, msg, onReply, proxy.executeOnReplyRoute, "onreply_route")
+}
+
+// onFailureTMCB dispatches the failure_route block bound to the
+// transaction when the transaction fails (non-2xx final response or FR
+// timeout). msg may be nil when the failure is a timeout rather than a
+// received reply; in that case the original request (cell.UAS.Request)
+// is used so the script can still inspect $rU / method / etc.
+func (p *ProxyCore) onFailureTMCB(cell *tm.Cell, branch int, msg *parser.SIPMsg, data interface{}) {
+	proxy, ok := data.(*ProxyCore)
+	if !ok || proxy == nil {
+		return
+	}
+	_, onFailure, _ := cell.TMRoutes()
+	if onFailure == "" {
+		return
+	}
+	proxy.dispatchTMRoute(cell, msg, onFailure, proxy.executeFailureRoute, "failure_route")
+}
+
+// onBranchTMCB dispatches the branch_route block bound to the
+// transaction when a request is about to be forwarded on a branch.
+func (p *ProxyCore) onBranchTMCB(cell *tm.Cell, branch int, msg *parser.SIPMsg, data interface{}) {
+	proxy, ok := data.(*ProxyCore)
+	if !ok || proxy == nil {
+		return
+	}
+	_, _, onBranch := cell.TMRoutes()
+	if onBranch == "" {
+		return
+	}
+	proxy.dispatchTMRoute(cell, msg, onBranch, proxy.executeBranchRoute, "branch_route")
+}
+
+// tmRouteRunner executes a named script route block against a fresh
+// ExecContext built from the TM event. Returns the context so the
+// caller can act on the script's decision (reply / drop / etc.).
+type tmRouteRunner func(sc *script.Script, name string, ctx *script.ExecContext) error
+
+// executeOnReplyRoute / executeFailureRoute / executeBranchRoute are
+// thin wrappers adapting the script executor entry points to the
+// tmRouteRunner signature used by dispatchTMRoute.
+func (p *ProxyCore) executeOnReplyRoute(sc *script.Script, name string, ctx *script.ExecContext) error {
+	return sc.ExecuteOnReplyRoute(name, ctx)
+}
+func (p *ProxyCore) executeFailureRoute(sc *script.Script, name string, ctx *script.ExecContext) error {
+	return sc.ExecuteFailureRoute(name, ctx)
+}
+func (p *ProxyCore) executeBranchRoute(sc *script.Script, name string, ctx *script.ExecContext) error {
+	return sc.ExecuteBranchRoute(name, ctx)
+}
+
+// dispatchTMRoute is the shared body of the three TMCB callbacks. It
+// resolves the script, builds a fresh ExecContext from the event's
+// message (falling back to the original UAS request when msg is nil,
+// e.g. for FR-timeout failures), runs the named route block, and then
+// honours the script's decision — notably sending a reply back to the
+// client when the route sets one (failure_route commonly does this to
+// return a 5xx on timeout).
+func (p *ProxyCore) dispatchTMRoute(cell *tm.Cell, msg *parser.SIPMsg, routeName string, run tmRouteRunner, kind string) {
+	if cell == nil {
+		return
+	}
+	p.mu.RLock()
+	sc := p.script
+	realm := ""
+	if p.config != nil {
+		realm = p.config.Realm
+	}
+	p.mu.RUnlock()
+	if sc == nil {
+		return
+	}
+
+	// Prefer the event message; fall back to the original request
+	// stored on the cell (e.g. FR-timeout fires with msg=nil).
+	eventMsg := msg
+	if eventMsg == nil {
+		cell.RLock()
+		eventMsg = cell.UAS.Request
+		cell.RUnlock()
+	}
+	if eventMsg == nil {
+		return
+	}
+
+	ctx := script.NewExecContext(eventMsg, cell.SourceAddr, realm)
+	if err := run(sc, routeName, ctx); err != nil {
+		if err == script.ErrRouteNotFound {
+			// The script bound a route name that no longer exists
+			// (e.g. renamed between reloads). Treat as a soft no-op.
+			return
+		}
+		log.Warn("tm script route error",
+			log.String("kind", kind),
+			log.String("route", routeName),
+			log.String("err", err.Error()))
+		return
+	}
+
+	// Honour the script's decision. The most important case is a
+	// failure_route that replies (e.g. 500 on timeout): we build the
+	// reply from the original request and send it to the stored
+	// source address so the client learns the call failed.
+	if ctx.Reply != nil && cell.SourceAddr != nil {
+		action := &ResponseAction{
+			Status:       ctx.Reply.Status,
+			Reason:       ctx.Reply.Reason,
+			ExtraHeaders: ctx.Reply.Headers,
+		}
+		// Build the reply against the original request so Via/From/To/
+		// Call-ID/CSeq are correct.
+		cell.RLock()
+		req := cell.UAS.Request
+		cell.RUnlock()
+		if req != nil {
+			if data := p.BuildReply(req, action); data != nil {
+				if err := p.Send(data, cell.SourceAddr); err != nil {
+					log.Warn("tm script route reply send failed",
+						log.String("kind", kind),
+						log.String("route", routeName),
+						log.String("err", err.Error()))
+				}
+			}
+		}
+	}
 }
 
 // SetCSCFAdaptors attaches IMS role adaptors. When non-empty, REGISTER and
@@ -731,6 +895,11 @@ func (p *ProxyCore) ProcessRequest(msg *parser.SIPMsg, src net.Addr, rcvInfo *tr
 	}
 
 	// Phase 27: dispatch through the routing script if one is installed.
+	// tmRoutes captures any t_on_reply / t_on_failure / t_on_branch
+	// bindings the script sets; they are stamped onto the TM cell after
+	// the transaction is created so the proxy's TMCB callbacks can
+	// dispatch the corresponding route block when the event fires.
+	var tmRoutes script.TMRoutes
 	if p.script != nil {
 		realm := ""
 		if p.config != nil {
@@ -741,6 +910,7 @@ func (p *ProxyCore) ProcessRequest(msg *parser.SIPMsg, src net.Addr, rcvInfo *tr
 			// On script error, fall through to default pipeline; never crash.
 			log.Warn("script execution error", log.String("err", err.Error()))
 		}
+		tmRoutes = ctx.TMRoutes
 		if ctx.Reply != nil {
 			action := &ResponseAction{
 				Status:       ctx.Reply.Status,
@@ -805,7 +975,7 @@ func (p *ProxyCore) ProcessRequest(msg *parser.SIPMsg, src net.Addr, rcvInfo *tr
 	case parser.MethodRegister:
 		action = p.dispatchRegister(msg, src)
 	case parser.MethodInvite:
-		action = p.dispatchInvite(msg, src)
+		action = p.dispatchInvite(msg, src, tmRoutes)
 	case parser.MethodACK:
 		action = p.dispatchACK(msg)
 	case parser.MethodBye:
@@ -822,7 +992,7 @@ func (p *ProxyCore) ProcessRequest(msg *parser.SIPMsg, src net.Addr, rcvInfo *tr
 		// Keep-alive ping - always accepted.
 		action = ResponseAction{Status: 200, Reason: "OK"}
 	case parser.MethodInfo, parser.MethodMessage, parser.MethodRefer, parser.MethodUpdate, parser.MethodPRACK:
-		action = p.dispatchNonInvite(msg, src)
+		action = p.dispatchNonInvite(msg, src, tmRoutes)
 	default:
 		p.metrics.incError(405)
 		action = ResponseAction{Status: 405, Reason: "Method Not Allowed"}
@@ -879,11 +1049,14 @@ func (p *ProxyCore) ProcessReply(msg *parser.SIPMsg, src net.Addr) ResponseActio
 		}
 	}
 
-	// Phase 44: TM lookup for reply tracking.
+	// Phase 44: TM reply processing. HandleResponse (not just TLookup)
+	// is used so the transaction state machine advances and the TMCB
+	// callbacks fire — this is what drives onreply_route / failure_route
+	// dispatch for replies received by the proxy. A missing transaction
+	// is not fatal: the reply still passes through with Via stripped.
 	if tmMgr != nil {
-		if _, err := tm.TLookup(tmMgr, msg); err != nil {
-			// No matching transaction cell is not fatal for reply passthrough.
-			log.Warn("tm lookup error", log.String("err", err.Error()))
+		if _, _, err := tmMgr.HandleResponse(msg); err != nil {
+			log.Warn("tm handle response error", log.String("err", err.Error()))
 		}
 	}
 
@@ -1148,8 +1321,11 @@ func (p *ProxyCore) dispatchRegisterViaCSCF(msg *parser.SIPMsg, src net.Addr) Re
 
 // dispatchInvite drives dialog creation and TM relay for INVITE requests.
 // After TM/dialog bookkeeping the request continues through the normal
-// forward/fork/media pipeline.
-func (p *ProxyCore) dispatchInvite(msg *parser.SIPMsg, src net.Addr) ResponseAction {
+// forward/fork/media pipeline. tmRoutes carries any t_on_reply /
+// t_on_failure / t_on_branch bindings the script set; they are stamped
+// onto the created transaction cell so the proxy's TMCB callbacks can
+// dispatch the corresponding route block later.
+func (p *ProxyCore) dispatchInvite(msg *parser.SIPMsg, src net.Addr, tmRoutes script.TMRoutes) ResponseAction {
 	// IMS role adaptors first.
 	if act := p.dispatchInviteViaCSCF(msg, src); act.Status != 0 || act.Target != "" || act.StopRouting {
 		return act
@@ -1175,8 +1351,14 @@ func (p *ProxyCore) dispatchInvite(msg *parser.SIPMsg, src net.Addr) ResponseAct
 		}
 	}
 	if tmMgr != nil {
-		if _, err := tm.TRelay(tmMgr, msg); err != nil {
+		if cell, err := tm.TRelay(tmMgr, msg); err != nil {
 			log.Warn("tm relay error", log.String("err", err.Error()))
+		} else if cell != nil {
+			// Stamp the script's route bindings and the client source
+			// address onto the cell so TMCB callbacks can dispatch the
+			// routes and send replies back to the client.
+			cell.SetTMRoutes(tmRoutes.OnReply, tmRoutes.OnFailure, tmRoutes.OnBranch)
+			cell.SourceAddr = src
 		}
 	}
 
@@ -1260,13 +1442,18 @@ func (p *ProxyCore) dispatchCancel(msg *parser.SIPMsg) ResponseAction {
 
 // dispatchNonInvite handles MESSAGE, OPTIONS, INFO, SUBSCRIBE, PUBLISH and
 // other non-INVITE requests through TM before continuing with forwarding.
-func (p *ProxyCore) dispatchNonInvite(msg *parser.SIPMsg, src net.Addr) ResponseAction {
+// tmRoutes carries any t_on_reply / t_on_failure / t_on_branch bindings
+// the script set; they are stamped onto the created transaction cell.
+func (p *ProxyCore) dispatchNonInvite(msg *parser.SIPMsg, src net.Addr, tmRoutes script.TMRoutes) ResponseAction {
 	p.mu.RLock()
 	tmMgr := p.tmMgr
 	p.mu.RUnlock()
 	if tmMgr != nil {
-		if _, err := tm.TForwardNonInvite(tmMgr, msg); err != nil {
+		if cell, err := tm.TForwardNonInvite(tmMgr, msg); err != nil {
 			log.Warn("tm forward non-invite error", log.String("err", err.Error()))
+		} else if cell != nil {
+			cell.SetTMRoutes(tmRoutes.OnReply, tmRoutes.OnFailure, tmRoutes.OnBranch)
+			cell.SourceAddr = src
 		}
 	}
 	return ResponseAction{Status: 200, Reason: "OK"}

@@ -9,6 +9,7 @@ package tm
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -171,8 +172,45 @@ type Cell struct {
 	OnReply        int
 	OnBranch       int
 
+	// Script route-block names bound to this transaction by
+	// t_on_reply / t_on_failure / t_on_branch. The tm layer treats
+	// these as opaque strings; the proxy's TMCB callbacks read them
+	// back to dispatch the corresponding script route when the
+	// matching event fires. Empty means no route is bound.
+	OnReplyRoute   string
+	OnFailureRoute string
+	OnBranchRoute  string
+
+	// SourceAddr is the network address of the client that sent the
+	// original request. Stored so TMCB callbacks (which run outside
+	// ProcessRequest) can send replies back to the client — e.g. when
+	// a failure_route script decides to reply with a 5xx.
+	SourceAddr net.Addr
+
 	// Created timestamp
 	CreatedAt      time.Time
+}
+
+// SetTMRoutes records the script route-block names bound to this
+// transaction by t_on_reply / t_on_failure / t_on_branch. Empty names
+// mean no route is bound for that event. Safe for concurrent use.
+func (c *Cell) SetTMRoutes(onReply, onFailure, onBranch string) {
+	c.Lock()
+	c.OnReplyRoute = onReply
+	c.OnFailureRoute = onFailure
+	c.OnBranchRoute = onBranch
+	c.Unlock()
+}
+
+// TMRoutes returns the script route-block names bound to this
+// transaction. Safe for concurrent use.
+func (c *Cell) TMRoutes() (onReply, onFailure, onBranch string) {
+	c.RLock()
+	onReply = c.OnReplyRoute
+	onFailure = c.OnFailureRoute
+	onBranch = c.OnBranchRoute
+	c.RUnlock()
+	return
 }
 
 // IsInvite returns true if the transaction is for an INVITE
