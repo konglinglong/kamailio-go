@@ -33,6 +33,7 @@
 package script
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -57,6 +58,13 @@ const (
 	ActSetVar
 	ActRoute
 	ActReturn
+	// TM route-binding actions: t_on_reply / t_on_failure / t_on_branch
+	// record a named route block on the current transaction so the tm
+	// engine knows which script route to dispatch when the corresponding
+	// callback fires.
+	ActTOnReply
+	ActTOnFailure
+	ActTOnBranch
 )
 
 // Action is one script instruction. Actions form a linked list inside a
@@ -77,6 +85,16 @@ type Action struct {
 type Script struct {
 	Root   []*Action           // default `request_route { ... }` block
 	Routes map[string][]*Action // named routes keyed by route name
+
+	// TM route blocks. Each is a map keyed by route name, mirroring the
+	// `Routes` map above. They are populated by the corresponding
+	// top-level blocks (failure_route[NAME] { ... }, etc.) and dispatched
+	// by the executor's ExecuteFailureRoute / ExecuteOnReplyRoute /
+	// ExecuteBranchRoute entry points when the tm engine fires the
+	// matching callback.
+	FailureRoutes map[string][]*Action
+	BranchRoutes  map[string][]*Action
+	OnReplyRoutes map[string][]*Action
 }
 
 // ParseScript parses script text into a Script AST.
@@ -92,6 +110,12 @@ func ParseScript(text string) (*Script, error) {
 // Parse is a convenience alias for ParseScript so callers can write
 // script.Parse(text) without remembering the longer name.
 func Parse(text string) (*Script, error) { return ParseScript(text) }
+
+// ErrRouteNotFound is returned by ExecuteFailureRoute / ExecuteOnReplyRoute
+// / ExecuteBranchRoute when the named route block does not exist in the
+// script. Callers should treat it as a soft no-op (the tm callback has
+// nothing to dispatch) rather than a hard error.
+var ErrRouteNotFound = errors.New("script: route not found")
 
 // ---------------------------------------------------------------------------
 // tokenizer
@@ -277,7 +301,12 @@ func (p *parserState) expect(kind tokKind, text string) (tok, error) {
 }
 
 func (p *parserState) parseTopLevel() (*Script, error) {
-	sc := &Script{Routes: make(map[string][]*Action)}
+	sc := &Script{
+		Routes:        make(map[string][]*Action),
+		FailureRoutes: make(map[string][]*Action),
+		BranchRoutes:  make(map[string][]*Action),
+		OnReplyRoutes: make(map[string][]*Action),
+	}
 	for {
 		t := p.cur()
 		if t.kind == tokEOF {
@@ -299,30 +328,60 @@ func (p *parserState) parseTopLevel() (*Script, error) {
 			}
 			sc.Root = actions
 		case "route":
-			if _, err := p.expect(tokSymbol, "["); err != nil {
-				return nil, err
-			}
-			rtTok := p.cur()
-			if rtTok.kind != tokIdent && rtTok.kind != tokString && rtTok.kind != tokNumber {
-				return nil, fmt.Errorf("line %d: expected route name, got %q", rtTok.line, rtTok.text)
-			}
-			p.advance()
-			if _, err := p.expect(tokSymbol, "]"); err != nil {
-				return nil, err
-			}
-			if _, err := p.expect(tokSymbol, "{"); err != nil {
-				return nil, err
-			}
-			actions, err := p.parseBlock()
+			actions, rtName, err := p.parseNamedRouteBlock()
 			if err != nil {
 				return nil, err
 			}
-			sc.Routes[rtTok.text] = actions
+			sc.Routes[rtName] = actions
+		case "failure_route":
+			actions, rtName, err := p.parseNamedRouteBlock()
+			if err != nil {
+				return nil, err
+			}
+			sc.FailureRoutes[rtName] = actions
+		case "branch_route":
+			actions, rtName, err := p.parseNamedRouteBlock()
+			if err != nil {
+				return nil, err
+			}
+			sc.BranchRoutes[rtName] = actions
+		case "onreply_route":
+			actions, rtName, err := p.parseNamedRouteBlock()
+			if err != nil {
+				return nil, err
+			}
+			sc.OnReplyRoutes[rtName] = actions
 		default:
 			return nil, fmt.Errorf("line %d: unknown top-level block %q", t.line, name)
 		}
 	}
 	return sc, nil
+}
+
+// parseNamedRouteBlock parses the `[NAME] { ... }` suffix that follows
+// a named top-level route keyword (route, failure_route, branch_route,
+// onreply_route). The leading keyword has already been consumed by the
+// caller. Returns the parsed actions and the route name.
+func (p *parserState) parseNamedRouteBlock() ([]*Action, string, error) {
+	if _, err := p.expect(tokSymbol, "["); err != nil {
+		return nil, "", err
+	}
+	rtTok := p.cur()
+	if rtTok.kind != tokIdent && rtTok.kind != tokString && rtTok.kind != tokNumber {
+		return nil, "", fmt.Errorf("line %d: expected route name, got %q", rtTok.line, rtTok.text)
+	}
+	p.advance()
+	if _, err := p.expect(tokSymbol, "]"); err != nil {
+		return nil, "", err
+	}
+	if _, err := p.expect(tokSymbol, "{"); err != nil {
+		return nil, "", err
+	}
+	actions, err := p.parseBlock()
+	if err != nil {
+		return nil, "", err
+	}
+	return actions, rtTok.text, nil
 }
 
 // parseBlock reads actions until the matching closing '}'. The opening
@@ -460,22 +519,29 @@ func (p *parserState) parseAction() (*Action, error) {
 		}
 		return &Action{Type: ActAppendBranch, Arg: uriTok.text}, nil
 	case "route":
-		p.advance()
-		if _, err := p.expect(tokSymbol, "("); err != nil {
+		name, err := p.parseRouteNameArg()
+		if err != nil {
 			return nil, err
 		}
-		nameTok := p.cur()
-		if nameTok.kind != tokString && nameTok.kind != tokIdent && nameTok.kind != tokNumber {
-			return nil, fmt.Errorf("line %d: expected route name, got %q", nameTok.line, nameTok.text)
-		}
-		p.advance()
-		if _, err := p.expect(tokSymbol, ")"); err != nil {
+		return &Action{Type: ActRoute, RouteName: name}, nil
+	case "t_on_reply":
+		name, err := p.parseRouteNameArg()
+		if err != nil {
 			return nil, err
 		}
-		if _, err := p.maybeSemicolon(); err != nil {
+		return &Action{Type: ActTOnReply, RouteName: name}, nil
+	case "t_on_failure":
+		name, err := p.parseRouteNameArg()
+		if err != nil {
 			return nil, err
 		}
-		return &Action{Type: ActRoute, RouteName: nameTok.text}, nil
+		return &Action{Type: ActTOnFailure, RouteName: name}, nil
+	case "t_on_branch":
+		name, err := p.parseRouteNameArg()
+		if err != nil {
+			return nil, err
+		}
+		return &Action{Type: ActTOnBranch, RouteName: name}, nil
 	case "return":
 		p.advance()
 		if _, err := p.maybeSemicolon(); err != nil {
@@ -484,6 +550,28 @@ func (p *parserState) parseAction() (*Action, error) {
 		return &Action{Type: ActReturn}, nil
 	}
 	return nil, fmt.Errorf("line %d: unknown action %q", t.line, t.text)
+}
+
+// parseRouteNameArg parses the ("name") suffix shared by route(),
+// t_on_reply(), t_on_failure() and t_on_branch(). The leading keyword
+// has already been consumed by the caller. Returns the route name.
+func (p *parserState) parseRouteNameArg() (string, error) {
+	p.advance()
+	if _, err := p.expect(tokSymbol, "("); err != nil {
+		return "", err
+	}
+	nameTok := p.cur()
+	if nameTok.kind != tokString && nameTok.kind != tokIdent && nameTok.kind != tokNumber {
+		return "", fmt.Errorf("line %d: expected route name, got %q", nameTok.line, nameTok.text)
+	}
+	p.advance()
+	if _, err := p.expect(tokSymbol, ")"); err != nil {
+		return "", err
+	}
+	if _, err := p.maybeSemicolon(); err != nil {
+		return "", err
+	}
+	return nameTok.text, nil
 }
 
 // maybeSemicolon consumes an optional trailing ';'.

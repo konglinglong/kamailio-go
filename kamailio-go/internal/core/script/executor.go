@@ -37,6 +37,14 @@ type ExecContext struct {
 	Drop   bool
 	Return bool
 
+	// TMRoutes holds the route-block names bound to the current
+	// transaction by t_on_reply / t_on_failure / t_on_branch. The
+	// proxy reads these after running request_route and registers the
+	// corresponding tm callbacks; the callbacks in turn dispatch the
+	// named route block via ExecuteOnReplyRoute / ExecuteFailureRoute /
+	// ExecuteBranchRoute.
+	TMRoutes TMRoutes
+
 	// breakFlag is set by the break statement inside switch/while.
 	// It is checked by runBlock and cleared by the enclosing
 	// switch/while handler so it does not leak to outer blocks.
@@ -50,6 +58,15 @@ type ExecContext struct {
 	// AVP and XAVP stores (used by lvalue.go assignments).
 	AVPs   *avp.Store
 	XAVPs  *XAVPStore
+}
+
+// TMRoutes records which named route blocks the script has bound to the
+// current transaction via t_on_reply / t_on_failure / t_on_branch. A
+// blank name means no route is set for that event.
+type TMRoutes struct {
+	OnReply   string
+	OnFailure string
+	OnBranch  string
 }
 
 // ReplyAction records a script's decision to reply to a request with a
@@ -84,6 +101,47 @@ func (s *Script) Execute(ctx *ExecContext) error {
 		return nil
 	}
 	return s.runBlock(s.Root, ctx)
+}
+
+// ExecuteFailureRoute runs the named failure_route block against ctx.
+// It is invoked by the tm engine's TMCBOnFailure callback. Returns
+// ErrRouteNotFound when no failure_route with the given name exists;
+// callers should treat that as a no-op rather than an error.
+func (s *Script) ExecuteFailureRoute(name string, ctx *ExecContext) error {
+	if s == nil || ctx == nil || name == "" {
+		return nil
+	}
+	block, ok := s.FailureRoutes[name]
+	if !ok {
+		return ErrRouteNotFound
+	}
+	return s.runBlock(block, ctx)
+}
+
+// ExecuteOnReplyRoute runs the named onreply_route block against ctx.
+// It is invoked by the tm engine's TMCBOnReply callback.
+func (s *Script) ExecuteOnReplyRoute(name string, ctx *ExecContext) error {
+	if s == nil || ctx == nil || name == "" {
+		return nil
+	}
+	block, ok := s.OnReplyRoutes[name]
+	if !ok {
+		return ErrRouteNotFound
+	}
+	return s.runBlock(block, ctx)
+}
+
+// ExecuteBranchRoute runs the named branch_route block against ctx.
+// It is invoked by the tm engine's TMCBOnBranch callback.
+func (s *Script) ExecuteBranchRoute(name string, ctx *ExecContext) error {
+	if s == nil || ctx == nil || name == "" {
+		return nil
+	}
+	block, ok := s.BranchRoutes[name]
+	if !ok {
+		return ErrRouteNotFound
+	}
+	return s.runBlock(block, ctx)
 }
 
 // runBlock executes a slice of actions sequentially. It stops early if
@@ -160,6 +218,12 @@ func (s *Script) runOne(a *Action, ctx *ExecContext) error {
 		return s.runBlock(block, ctx)
 	case ActReturn:
 		ctx.Return = true
+	case ActTOnReply:
+		ctx.TMRoutes.OnReply = a.RouteName
+	case ActTOnFailure:
+		ctx.TMRoutes.OnFailure = a.RouteName
+	case ActTOnBranch:
+		ctx.TMRoutes.OnBranch = a.RouteName
 	case ActBreak:
 		ctx.breakFlag = true
 	case ActSwitch:
