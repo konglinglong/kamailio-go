@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/kamailio/kamailio-go/internal/core/acc"
+	"github.com/kamailio/kamailio-go/internal/core/config"
 	"github.com/kamailio/kamailio-go/internal/core/dialog"
 	"github.com/kamailio/kamailio-go/internal/core/htable"
 	"github.com/kamailio/kamailio-go/internal/core/msilo"
@@ -31,19 +32,26 @@ import (
 	"github.com/kamailio/kamailio-go/internal/core/registrar"
 	"github.com/kamailio/kamailio-go/internal/core/script"
 	"github.com/kamailio/kamailio-go/internal/core/usrloc"
+	"github.com/kamailio/kamailio-go/internal/modules/cfg_db"
+	"github.com/kamailio/kamailio-go/internal/modules/cfg_rpc"
+	"github.com/kamailio/kamailio-go/internal/modules/cfgutils"
 )
 
 // ServerConfig captures the subsystem dependencies for a Server. Any
 // field may be nil — the corresponding RPC methods will return a
 // JSON-RPC error instead of panicking.
 type ServerConfig struct {
-	Core    *proxy.ProxyCore
-	Dialogs *dialog.Manager
-	Pike    *pike.Pike
-	HTables *htable.Manager
-	Msilo   *msilo.Msilo
-	Acc     *acc.AccountingService
-	Usrloc  *registrar.Registrar
+	Core          *proxy.ProxyCore
+	Dialogs       *dialog.Manager
+	Pike          *pike.Pike
+	HTables       *htable.Manager
+	Msilo         *msilo.Msilo
+	Acc           *acc.AccountingService
+	Usrloc        *registrar.Registrar
+	CfgRPC        *cfg_rpc.CfgRPCModule
+	CfgDB         *cfg_db.CfgDBModule
+	CfgUtils      *cfgutils.CfgUtilsModule
+	ConfigManager *config.Manager
 }
 
 // Server exposes a JSON-RPC 2.0 HTTP endpoint. Handlers are registered
@@ -58,6 +66,10 @@ type Server struct {
 	htables    *htable.Manager
 	msilo      *msilo.Msilo
 	usrloc     *registrar.Registrar
+	cfgRPC     *cfg_rpc.CfgRPCModule
+	cfgDB      *cfg_db.CfgDBModule
+	cfgUtils   *cfgutils.CfgUtilsModule
+	cfgMgr     *config.Manager
 	httpServer *http.Server
 	listener   atomic.Value
 	handler    *http.ServeMux
@@ -83,6 +95,10 @@ func NewExtended(cfg ServerConfig) *Server {
 		htables: cfg.HTables,
 		msilo:   cfg.Msilo,
 		usrloc:  cfg.Usrloc,
+		cfgRPC:  cfg.CfgRPC,
+		cfgDB:   cfg.CfgDB,
+		cfgUtils: cfg.CfgUtils,
+		cfgMgr:  cfg.ConfigManager,
 		handler: http.NewServeMux(),
 	}
 	s.handler.HandleFunc("/rpc", s.handleRPC)
@@ -456,6 +472,287 @@ func (s *Server) dispatch(method string, params []interface{}) (interface{}, *me
 			out["metrics"] = s.core.MetricsSnapshot()
 		}
 		return out, nil
+
+	case "kamailio.cfg.get":
+		// Mirrors C's cfg.get(group_name, var_name). The Kamailio-Go
+		// cfg_rpc module exposes a single flat key namespace, so the
+		// call collapses to cfg.get(key). Returns the current value
+		// (or the registered default) and a not-found flag.
+		if s.cfgRPC == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_rpc module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [key]"}
+		}
+		key, _ := params[0].(string)
+		val, err := s.cfgRPC.Get(key)
+		if err != nil {
+			return map[string]interface{}{"found": false, "key": key}, nil
+		}
+		return map[string]interface{}{"found": true, "key": key, "value": val}, nil
+
+	case "kamailio.cfg.set":
+		// Mirrors C's cfg.sets/cfg.seti. Values are stored as strings;
+		// numeric values are stringified by fmt.
+		if s.cfgRPC == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_rpc module not wired up"}
+		}
+		if len(params) < 2 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [key, value]"}
+		}
+		key, _ := params[0].(string)
+		val := fmt.Sprintf("%v", params[1])
+		if err := s.cfgRPC.Set(key, val); err != nil {
+			return nil, &methodErr{Code: ErrInternal, Message: err.Error()}
+		}
+		return map[string]interface{}{"ok": true, "key": key, "value": val}, nil
+
+	case "kamailio.cfg.list":
+		// Mirrors C's cfg.list. Returns every known key (defaults
+		// overlaid with current overrides).
+		if s.cfgRPC == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_rpc module not wired up"}
+		}
+		all := s.cfgRPC.List()
+		out := make([]map[string]interface{}, 0, len(all))
+		for k, v := range all {
+			out = append(out, map[string]interface{}{"key": k, "value": v})
+		}
+		return map[string]interface{}{"ok": true, "count": len(out), "entries": out}, nil
+
+	case "kamailio.cfg.reset":
+		// Mirrors C's cfg.reset — restores the registered default for
+		// the named key, removing any runtime override.
+		if s.cfgRPC == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_rpc module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [key]"}
+		}
+		key, _ := params[0].(string)
+		if err := s.cfgRPC.Reset(key); err != nil {
+			return nil, &methodErr{Code: ErrInternal, Message: err.Error()}
+		}
+		return map[string]interface{}{"ok": true, "key": key}, nil
+
+	case "kamailio.cfg.reload":
+		// Mirrors C's cfg.reload (often issued via SIGHUP). Re-reads
+		// the source config file, validates it, swaps the live
+		// configuration and notifies subscribers.
+		if s.cfgMgr == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "config manager not wired up"}
+		}
+		newCfg, err := s.cfgMgr.Reload()
+		if err != nil {
+			return map[string]interface{}{"ok": false, "error": err.Error()}, nil
+		}
+		return map[string]interface{}{
+			"ok":      true,
+			"path":    s.cfgMgr.Path(),
+			"realm":   newCfg.Realm,
+			"workers": newCfg.Core.Workers,
+			"level":   newCfg.Core.LogLevel,
+		}, nil
+
+	case "kamailio.cfg.snapshot":
+		// Returns a JSON snapshot of the currently-installed
+		// configuration. Useful for operators verifying the effect of a
+		// reload without re-reading the file.
+		if s.cfgMgr == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "config manager not wired up"}
+		}
+		c := s.cfgMgr.Get()
+		if c == nil {
+			return map[string]interface{}{"ok": false, "error": "no config installed"}, nil
+		}
+		return map[string]interface{}{
+			"ok":       true,
+			"realm":    c.Realm,
+			"log_level": c.Core.LogLevel,
+			"workers":  c.Core.Workers,
+			"listen":   c.Core.Listen,
+			"ims":      c.IMS.Enabled,
+			"path":     s.cfgMgr.Path(),
+		}, nil
+
+	case "kamailio.cfgdb.load":
+		// cfg_db: load a single key. Returns {found:false} when the
+		// key is absent.
+		if s.cfgDB == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_db module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [key]"}
+		}
+		key, _ := params[0].(string)
+		val, err := s.cfgDB.Load(key)
+		if err != nil {
+			return map[string]interface{}{"found": false, "key": key}, nil
+		}
+		return map[string]interface{}{"found": true, "key": key, "value": val}, nil
+
+	case "kamailio.cfgdb.store":
+		// cfg_db: store (create or overwrite) a key/value pair.
+		if s.cfgDB == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_db module not wired up"}
+		}
+		if len(params) < 2 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [key, value]"}
+		}
+		key, _ := params[0].(string)
+		val := fmt.Sprintf("%v", params[1])
+		if err := s.cfgDB.Store(key, val); err != nil {
+			return nil, &methodErr{Code: ErrInternal, Message: err.Error()}
+		}
+		return map[string]interface{}{"ok": true, "key": key, "value": val}, nil
+
+	case "kamailio.cfgdb.delete":
+		// cfg_db: delete a key. Returns {ok:false} when absent.
+		if s.cfgDB == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_db module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [key]"}
+		}
+		key, _ := params[0].(string)
+		if err := s.cfgDB.Delete(key); err != nil {
+			return map[string]interface{}{"ok": false, "key": key}, nil
+		}
+		return map[string]interface{}{"ok": true, "key": key}, nil
+
+	case "kamailio.cfgdb.list":
+		// cfg_db: list all stored key/value pairs.
+		if s.cfgDB == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfg_db module not wired up"}
+		}
+		all := s.cfgDB.List()
+		out := make([]map[string]interface{}, 0, len(all))
+		for k, v := range all {
+			out = append(out, map[string]interface{}{"key": k, "value": v})
+		}
+		return map[string]interface{}{"ok": true, "count": len(out), "entries": out}, nil
+
+	case "kamailio.shv.get":
+		// cfgutils $shv: read a shared string variable.
+		if s.cfgUtils == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfgutils module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [name]"}
+		}
+		name, _ := params[0].(string)
+		return map[string]interface{}{
+			"name":    name,
+			"exists":  s.cfgUtils.VarExists(name),
+			"value":   s.cfgUtils.GetVar(name),
+		}, nil
+
+	case "kamailio.shv.set":
+		// cfgutils $shv: assign a shared string variable.
+		if s.cfgUtils == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfgutils module not wired up"}
+		}
+		if len(params) < 2 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [name, value]"}
+		}
+		name, _ := params[0].(string)
+		val := fmt.Sprintf("%v", params[1])
+		s.cfgUtils.SetVar(name, val)
+		return map[string]interface{}{"ok": true, "name": name, "value": val}, nil
+
+	case "kamailio.shv.list":
+		// cfgutils $shv: list all shared variables. The module does
+		// not expose a direct List method, so we surface existence +
+		// value for each name passed in. With no params, returns the
+		// count of registered variables is not tracked separately; we
+		// return an empty list when no names are queried.
+		if s.cfgUtils == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfgutils module not wired up"}
+		}
+		queried := make([]map[string]interface{}, 0, len(params))
+		for _, p := range params {
+			name, ok := p.(string)
+			if !ok {
+				continue
+			}
+			queried = append(queried, map[string]interface{}{
+				"name":   name,
+				"exists": s.cfgUtils.VarExists(name),
+				"value":  s.cfgUtils.GetVar(name),
+			})
+		}
+		return map[string]interface{}{"ok": true, "count": len(queried), "entries": queried}, nil
+
+	case "kamailio.cnt.get":
+		// cfgutils $cnt: read a named counter.
+		if s.cfgUtils == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfgutils module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [name]"}
+		}
+		name, _ := params[0].(string)
+		return map[string]interface{}{"name": name, "value": s.cfgUtils.GetCount(name)}, nil
+
+	case "kamailio.cnt.set":
+		// cfgutils $cnt: assign a named counter.
+		if s.cfgUtils == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfgutils module not wired up"}
+		}
+		if len(params) < 2 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [name, value]"}
+		}
+		name, _ := params[0].(string)
+		var val int64
+		switch v := params[1].(type) {
+		case float64:
+			val = int64(v)
+		case int:
+			val = int64(v)
+		case int64:
+			val = v
+		case string:
+			fmt.Sscanf(v, "%d", &val)
+		default:
+			fmt.Sscanf(fmt.Sprintf("%v", v), "%d", &val)
+		}
+		s.cfgUtils.SetCount(name, val)
+		return map[string]interface{}{"ok": true, "name": name, "value": val}, nil
+
+	case "kamailio.cnt.inc":
+		// cfgutils $cnt: atomically add delta (default +1) to a counter.
+		if s.cfgUtils == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfgutils module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [name, delta?]"}
+		}
+		name, _ := params[0].(string)
+		delta := int64(1)
+		if len(params) >= 2 {
+			switch v := params[1].(type) {
+			case float64:
+				delta = int64(v)
+			case int:
+				delta = int64(v)
+			case string:
+				fmt.Sscanf(v, "%d", &delta)
+			}
+		}
+		newVal := s.cfgUtils.IncCount(name, delta)
+		return map[string]interface{}{"ok": true, "name": name, "value": newVal}, nil
+
+	case "kamailio.cnt.reset":
+		// cfgutils $cnt: reset a named counter to 0.
+		if s.cfgUtils == nil {
+			return nil, &methodErr{Code: ErrDisabled, Message: "cfgutils module not wired up"}
+		}
+		if len(params) < 1 {
+			return nil, &methodErr{Code: ErrParams, Message: "usage: [name]"}
+		}
+		name, _ := params[0].(string)
+		s.cfgUtils.ResetCount(name)
+		return map[string]interface{}{"ok": true, "name": name, "value": int64(0)}, nil
 
 	case "kamailio.ul.dump":
 		// Mirrors C's "ul.dump" operator command. With no params,

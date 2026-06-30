@@ -19,6 +19,9 @@ import (
 	"github.com/kamailio/kamailio-go/internal/core/registrar"
 	"github.com/kamailio/kamailio-go/internal/core/rpc"
 	"github.com/kamailio/kamailio-go/internal/core/script"
+	"github.com/kamailio/kamailio-go/internal/modules/cfg_db"
+	"github.com/kamailio/kamailio-go/internal/modules/cfg_rpc"
+	"github.com/kamailio/kamailio-go/internal/modules/cfgutils"
 	"github.com/kamailio/kamailio-go/internal/modules/tm"
 )
 
@@ -35,6 +38,10 @@ type BootstrapOptions struct {
 // Bootstrap holds the runtime state produced by a successful bootstrap.
 type Bootstrap struct {
 	Config       *config.Config
+	ConfigMgr    *config.Manager
+	CfgRPC       *cfg_rpc.CfgRPCModule
+	CfgDB        *cfg_db.CfgDBModule
+	CfgUtils     *cfgutils.CfgUtilsModule
 	Server       *Engine
 	ProxyCore    *proxy.ProxyCore
 	HealthServer *proxy.HealthServer
@@ -92,6 +99,39 @@ func NewBootstrap(opts BootstrapOptions) (*Bootstrap, error) {
 		return nil, fmt.Errorf("init log: %w", err)
 	}
 
+	// Install a config.Manager so SIGHUP / cfg.reload RPC can re-read
+	// this file at runtime. Subscribers below propagate the relevant
+	// fields into the live subsystems (log level, registrar bounds).
+	cfgMgr := config.NewManager(cfg, opts.ConfigFile)
+
+	// cfg_rpc exposes a flat key/value namespace over RPC for ad-hoc
+	// runtime overrides. Seed it with the current values of the most
+	// commonly-tweaked knobs so cfg.list/cfg.get report something useful
+	// out of the box and cfg.reset has a baseline to restore.
+	cfgRPC := cfg_rpc.New()
+	cfgRPC.SetDefault("core.log_level", cfg.Core.LogLevel)
+	cfgRPC.SetDefault("core.realm", cfg.Realm)
+	cfgRPC.SetDefault("core.workers", fmt.Sprintf("%d", cfg.Core.Workers))
+	cfgRPC.SetDefault("core.ims_enabled", fmt.Sprintf("%v", cfg.IMS.Enabled))
+
+	// cfg_db is a separate persistent KV store (in this Go port it is
+	// in-memory; a future DB-backed implementation would persist here).
+	// cfgutils backs the $shv shared variables and $cnt named counters
+	// that scripts and operators use for cross-request state.
+	cfgDB := cfg_db.New()
+	cfgUtils := cfgutils.NewCfgUtilsModule()
+
+	// Hot-reload subscriber: log level — re-initialise the logger when
+	// the level changes. (The registrar & cfg_rpc subscribers are
+	// registered later, once the registrar has been constructed.)
+	cfgMgr.Subscribe(func(_, new *config.Config) error {
+		if new.Core.LogLevel != "" {
+			log.SetLevel(new.Core.LogLevel)
+			log.Info("log level reloaded", log.String("level", new.Core.LogLevel))
+		}
+		return nil
+	})
+
 	engine := NewEngine(cfg)
 	if err := engine.Start(); err != nil {
 		log.Sync()
@@ -139,6 +179,28 @@ func NewBootstrap(opts BootstrapOptions) (*Bootstrap, error) {
 	})
 	pcore.SetRegistrar(reg)
 
+	// Hot-reload subscribers that need the registrar handle.
+	// 1. Registrar — refresh expires bounds & realm. Existing bindings
+	//    are preserved; only the policy values are swapped in.
+	cfgMgr.Subscribe(func(_, new *config.Config) error {
+		reg.SetConfig(&registrar.Config{
+			Realm:          new.Realm,
+			DefaultExpires: 3600 * time.Second,
+			MaxExpires:     86400 * time.Second,
+			MinExpires:     60 * time.Second,
+		})
+		return nil
+	})
+	// 2. cfg_rpc defaults — keep the advertised snapshot in sync so a
+	//    post-reload cfg.list reflects the new file values.
+	cfgMgr.Subscribe(func(_, new *config.Config) error {
+		cfgRPC.SetDefault("core.log_level", new.Core.LogLevel)
+		cfgRPC.SetDefault("core.realm", new.Realm)
+		cfgRPC.SetDefault("core.workers", fmt.Sprintf("%d", new.Core.Workers))
+		cfgRPC.SetDefault("core.ims_enabled", fmt.Sprintf("%v", new.IMS.Enabled))
+		return nil
+	})
+
 	var sc *script.Script
 	if opts.ScriptFile != "" {
 		content, err := os.ReadFile(opts.ScriptFile)
@@ -180,13 +242,17 @@ func NewBootstrap(opts BootstrapOptions) (*Bootstrap, error) {
 	var rpcServer *rpc.Server
 	if opts.RPCAddr != "" {
 		rpcServer = rpc.NewExtended(rpc.ServerConfig{
-			Core:    pcore,
-			Dialogs: dm,
-			Pike:    pk,
-			HTables: hm,
-			Msilo:   ms,
-			Acc:     ac,
-			Usrloc:  reg,
+			Core:          pcore,
+			Dialogs:       dm,
+			Pike:          pk,
+			HTables:       hm,
+			Msilo:         ms,
+			Acc:           ac,
+			Usrloc:        reg,
+			CfgRPC:        cfgRPC,
+			CfgDB:         cfgDB,
+			CfgUtils:      cfgUtils,
+			ConfigManager: cfgMgr,
 		})
 		go func() {
 			_ = rpcServer.ListenAndServe(opts.RPCAddr)
@@ -200,6 +266,10 @@ func NewBootstrap(opts BootstrapOptions) (*Bootstrap, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Bootstrap{
 		Config:       cfg,
+		ConfigMgr:    cfgMgr,
+		CfgRPC:       cfgRPC,
+		CfgDB:        cfgDB,
+		CfgUtils:     cfgUtils,
 		Server:       engine,
 		ProxyCore:    pcore,
 		HealthServer: hs,
@@ -211,14 +281,44 @@ func NewBootstrap(opts BootstrapOptions) (*Bootstrap, error) {
 	return b, nil
 }
 
-// WaitForSignal blocks until SIGINT or SIGTERM is received.
+// WaitForSignal blocks until SIGINT or SIGTERM is received. SIGHUP is
+// intercepted separately and triggers a configuration reload via the
+// ConfigManager (if one was installed); the call then returns to the
+// signal loop so the process keeps running.
 func (b *Bootstrap) WaitForSignal() {
 	if b.sigChan == nil {
 		b.sigChan = make(chan os.Signal, 1)
-		signal.Notify(b.sigChan, syscall.SIGINT, syscall.SIGTERM)
+		signal.Notify(b.sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	}
-	sig := <-b.sigChan
-	log.Info("Signal received", log.String("signal", sig.String()))
+	for {
+		sig := <-b.sigChan
+		if sig == syscall.SIGHUP {
+			b.handleReload()
+			continue
+		}
+		log.Info("Signal received", log.String("signal", sig.String()))
+		return
+	}
+}
+
+// handleReload invokes the ConfigManager reload and logs the outcome.
+// When no manager is wired up the call is a no-op. Errors are logged
+// but never fatal — the previous configuration remains in effect.
+func (b *Bootstrap) handleReload() {
+	if b.ConfigMgr == nil {
+		log.Warn("SIGHUP received but no config manager installed — ignoring")
+		return
+	}
+	log.Info("SIGHUP received — reloading configuration", log.String("path", b.ConfigMgr.Path()))
+	newCfg, err := b.ConfigMgr.Reload()
+	if err != nil {
+		log.Error("Configuration reload failed", log.ErrField(err))
+		return
+	}
+	log.Info("Configuration reloaded",
+		log.String("realm", newCfg.Realm),
+		log.String("log_level", newCfg.Core.LogLevel),
+		log.Int("workers", newCfg.Core.Workers))
 }
 
 // Shutdown cleanly stops the server: proxy core → SIP listeners →

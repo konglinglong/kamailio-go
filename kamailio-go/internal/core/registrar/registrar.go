@@ -129,6 +129,29 @@ func New(cfg *Config) *Registrar {
 	}
 }
 
+// SetConfig replaces the registrar's runtime configuration. It is
+// intended for hot-reload: the new cfg's zero-value fields are filled
+// with the same defaults applied by New(). Existing domain bindings are
+// preserved.
+func (r *Registrar) SetConfig(cfg *Config) {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	cfg.defaults()
+	r.mu.Lock()
+	r.cfg = cfg
+	r.mu.Unlock()
+}
+
+// Config returns a pointer to the registrar's current runtime
+// configuration. Callers must not mutate the returned struct; use
+// SetConfig to install a new one.
+func (r *Registrar) Config() *Config {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg
+}
+
 // Domain returns the usrloc domain for name, creating and caching it on first
 // use.  Typical "name" is the host part of the AOR (e.g. "example.com").
 func (r *Registrar) Domain(name string) *usrloc.Domain {

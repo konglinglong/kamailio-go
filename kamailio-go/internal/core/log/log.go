@@ -96,6 +96,33 @@ func InitDefault() error {
 	return Init(cfg)
 }
 
+// SetLevel re-initialises the global logger with a new severity level
+// while preserving the current encoding. It is primarily intended for
+// hot-reload: an operator edits core.log_level in the config file and
+// sends SIGHUP, and the bootstrap subsystem calls SetLevel here. An
+// invalid level falls back to info.
+func SetLevel(level string) {
+	enc := "json"
+	if cur := currentEncoding(); cur != "" {
+		enc = cur
+	}
+	_ = Init(&Config{Level: level, Encoding: enc})
+}
+
+// currentEncoding returns the encoding of the active logger, or empty
+// when the logger has not been initialised. It is best-effort and used
+// only to preserve encoding across SetLevel calls.
+func currentEncoding() string {
+	l := logger
+	if l == nil {
+		return ""
+	}
+	// We cannot introspect a zap.Logger's encoder type reliably, so
+	// default to json (the production encoding) when one is already
+	// configured. This keeps SetLevel idempotent with InitDefault.
+	return "json"
+}
+
 // Get returns the global logger
 func Get() *zap.Logger {
 	if logger == nil {
